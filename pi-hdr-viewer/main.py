@@ -5,7 +5,10 @@ Kiosk-style app using DRM/KMS for direct HDMI output.
 Always-HDR mode: grid, viewer, and config all render to HDR10.
 
 Usage:
-    python main.py [photo_directory]
+    python main.py [--cpu] [photo_directory]
+
+Options:
+    --cpu       Force CPU (numpy) rendering pipeline instead of GPU
 
 Controls:
     Arrow keys  -- navigate grid / prev/next photo
@@ -302,8 +305,12 @@ def render_toast(message: str, width: int, font: ImageFont.ImageFont,
 
 
 def main():
-    if len(sys.argv) > 1:
-        photo_dir = sys.argv[1]
+    # Parse arguments
+    force_cpu = "--cpu" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if args:
+        photo_dir = args[0]
     else:
         candidates = [
             os.path.join(os.path.dirname(__file__), "..", "demo-pics"),
@@ -323,6 +330,23 @@ def main():
 
     display = DRMDisplay()
     display.open()
+
+    # Initialize GPU pipeline (unless --cpu)
+    gpu_ctx = None
+    gpu = None
+    if not force_cpu:
+        try:
+            from gpu_context import GPUContext
+            from gpu_pipeline import GPUPipeline
+            gpu_ctx = GPUContext(display.fd)
+            gpu = GPUPipeline(gpu_ctx, display.width, display.height)
+            print("GPU: pipeline ready")
+        except Exception as e:
+            print(f"GPU: init failed ({e}), using CPU path")
+            gpu_ctx = None
+            gpu = None
+    else:
+        print("GPU: disabled (--cpu flag)")
 
     input_handler = InputHandler()
 
@@ -482,29 +506,60 @@ def main():
             if needs_render:
                 t0 = time.monotonic()
                 hdr_active = display._hdr_active
-                if state == AppState.GRID:
-                    pixels = grid.render_hdr() if hdr_active else grid.render_native()
-                elif state == AppState.VIEWER:
-                    pixels = viewer.render_hdr()
-                elif state == AppState.CONFIG:
-                    pixels = config_screen.render_hdr() if hdr_active else config_screen.render_native()
-                t1 = time.monotonic()
 
-                mm = fb.mmap_buffer()
-                mm.seek(0)
-                if fb.pitch == display.width * 4:
-                    mm.write(pixels.tobytes())
+                if gpu and hdr_active:
+                    # GPU render path (HDR mode only — GPU shader does PQ encoding)
+                    if state == AppState.VIEWER:
+                        viewer.render_to_gpu(gpu)
+                    elif state == AppState.GRID:
+                        gpu.render_fullscreen(grid._render_canvas())
+                    elif state == AppState.CONFIG:
+                        gpu.render_fullscreen(config_screen._render_canvas())
+                    t1 = time.monotonic()
+
+                    # Debug overlay: read back pixels, apply overlay, write
+                    if state == AppState.VIEWER and viewer.debug_mode:
+                        pixels = gpu.get_pixels()
+                        viewer._render_debug_overlay(
+                            pixels, viewer.source[viewer.current_index])
+                        mm = fb.mmap_buffer()
+                        mm.seek(0)
+                        if fb.pitch == display.width * 4:
+                            mm.write(pixels.tobytes())
+                        else:
+                            for y in range(display.height):
+                                mm.seek(y * fb.pitch)
+                                mm.write(pixels[y].tobytes())
+                    else:
+                        # Fast path: direct SSBO → mmap copy
+                        gpu.copy_to_framebuffer(fb)
+                    t2 = time.monotonic()
                 else:
-                    for y in range(display.height):
-                        mm.seek(y * fb.pitch)
-                        mm.write(pixels[y].tobytes())
-                t2 = time.monotonic()
+                    # CPU render path (also used for SDR TV mode)
+                    if state == AppState.GRID:
+                        pixels = grid.render_hdr() if hdr_active else grid.render_native()
+                    elif state == AppState.VIEWER:
+                        pixels = viewer.render_hdr()
+                    elif state == AppState.CONFIG:
+                        pixels = config_screen.render_hdr() if hdr_active else config_screen.render_native()
+                    t1 = time.monotonic()
+
+                    mm = fb.mmap_buffer()
+                    mm.seek(0)
+                    if fb.pitch == display.width * 4:
+                        mm.write(pixels.tobytes())
+                    else:
+                        for y in range(display.height):
+                            mm.seek(y * fb.pitch)
+                            mm.write(pixels[y].tobytes())
+                    t2 = time.monotonic()
 
                 # Overlay toast if active
                 if toast_message and (time.monotonic() - toast_time) < TOAST_DURATION:
                     toast_pixels = render_toast(toast_message, display.width,
                                                 toast_font, hdr_active)
                     toast_h = toast_pixels.shape[0]
+                    mm = fb.mmap_buffer()
                     mm.seek(0)
                     if fb.pitch == display.width * 4:
                         mm.write(toast_pixels.tobytes())
@@ -521,6 +576,10 @@ def main():
         print("\nExiting...")
 
     finally:
+        if gpu:
+            gpu.close()
+        if gpu_ctx:
+            gpu_ctx.close()
         input_handler.close()
         fb.close()
         display.close()

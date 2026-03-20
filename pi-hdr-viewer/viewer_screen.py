@@ -195,6 +195,51 @@ class ViewerScreen:
         self._cached_tv_hdr = self._tv_hdr_active
         return output
 
+    def render_to_gpu(self, gpu):
+        """Render current photo using GPU pipeline.
+
+        Uploads raw PIL images to GPU and dispatches compute shader.
+        The output is in the GPU pipeline's SSBO, ready for copy_to_framebuffer().
+        """
+        cache_key_match = (
+            self._cached_index == self.current_index
+            and self._cached_pixels is not None
+            and self._cached_gain_map == self.gain_map_enabled
+        )
+        if cache_key_match:
+            return  # Already rendered and SSBO still has the data
+
+        photo = self.source[self.current_index]
+        print(f"Rendering [GPU]: {photo.filename} ({self._render_mode_label()})")
+
+        if self.gain_map_enabled and photo.is_ultrahdr:
+            img = self.source.load_ultrahdr(self.current_index)
+            fitted_sdr = self._fit_image(img.sdr)
+            if img.gain_map is not None:
+                fitted_gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+            else:
+                fitted_gm = None
+
+            pw, ph = fitted_sdr.size
+            x_offset = (self.display_width - pw) // 2
+            y_offset = (self.display_height - ph) // 2
+
+            gpu.render_hdr(fitted_sdr, fitted_gm, img.params,
+                           pw, ph, x_offset, y_offset)
+        else:
+            sdr = self.source.load_sdr(self.current_index)
+            fitted = self._fit_image(sdr)
+
+            pw, ph = fitted.size
+            x_offset = (self.display_width - pw) // 2
+            y_offset = (self.display_height - ph) // 2
+
+            gpu.render_sdr(fitted, pw, ph, x_offset, y_offset)
+
+        self._cached_index = self.current_index
+        self._cached_pixels = True  # Sentinel: SSBO has the data
+        self._cached_gain_map = self.gain_map_enabled
+
     def render_sdr(self) -> np.ndarray:
         """Render current photo as XRGB8888 SDR pixels (fallback)."""
         from hdr_pipeline import process_sdr_to_xrgb8888
