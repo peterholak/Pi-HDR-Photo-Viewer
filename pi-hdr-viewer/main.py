@@ -14,8 +14,8 @@ Controls:
     Space       -- toggle slideshow
     C           -- open config screen
     D           -- toggle debug overlay (viewer)
-    G           -- cycle render pipeline: HDR PQ / SDR PQ / SDR Native
-    H           -- toggle TV between HDR10 and SDR
+    G           -- toggle gain map on/off (viewer)
+    H           -- toggle TV HDR10/SDR (switches render pipeline too)
     Q           -- quit
 """
 
@@ -261,7 +261,7 @@ def _find_toast_font():
                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
                "/usr/share/fonts/TTF/DejaVuSans.ttf"]:
         try:
-            return ImageFont.truetype(fp, 28)
+            return ImageFont.truetype(fp, 60)
         except (OSError, IOError):
             continue
     return ImageFont.load_default()
@@ -273,22 +273,27 @@ def render_toast(message: str, width: int, font: ImageFont.ImageFont,
 
     Returns XRGB2101010 pixels of shape (bar_height, width).
     """
-    bar_height = 50
+    bar_height = 100
     img = Image.new("RGB", (width, bar_height), (0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     # Measure text to center it
     bbox = draw.textbbox((0, 0), message, font=font)
     tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
     # Draw dark background pill
-    pad_x = 30
+    pad_x = 40
+    pad_y = 12
     pill_x0 = (width - tw) // 2 - pad_x
     pill_x1 = (width + tw) // 2 + pad_x
-    draw.rounded_rectangle([pill_x0, 4, pill_x1, bar_height - 4],
-                           radius=10, fill=(40, 40, 40))
+    pill_y0 = (bar_height - th) // 2 - pad_y
+    pill_y1 = (bar_height + th) // 2 + pad_y
+    draw.rounded_rectangle([pill_x0, pill_y0, pill_x1, pill_y1],
+                           radius=16, fill=(40, 40, 40))
     # Draw text
     tx = (width - tw) // 2
-    draw.text((tx, 12), message, fill=(230, 230, 230), font=font)
+    ty = (bar_height - th) // 2
+    draw.text((tx, ty), message, fill=(230, 230, 230), font=font)
 
     if hdr_mode:
         return process_sdr_to_xrgb2101010(img)
@@ -380,7 +385,7 @@ def main():
     enter_grid()
 
     print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
-    print("  C: config   D: debug overlay   G: cycle render   H: toggle HDR/SDR")
+    print("  C: config   D: debug overlay   G: toggle gain map   H: toggle HDR/SDR")
 
     try:
         while True:
@@ -438,9 +443,9 @@ def main():
                         needs_render = True
                         show_toast(f"Debug: {'ON' if viewer.debug_mode else 'OFF'}")
                     elif key_code == KEY_G:
-                        viewer.cycle_render_mode()
+                        viewer.toggle_gain_map()
                         needs_render = True
-                        show_toast(f"Render: {viewer.render_mode_label}")
+                        show_toast(f"Gain map: {'ON' if viewer.gain_map_enabled else 'OFF'}")
                     elif key_code == KEY_H:
                         new_hdr = not display._hdr_active
                         display.set_hdr_enabled(new_hdr)

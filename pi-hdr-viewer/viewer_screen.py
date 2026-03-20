@@ -1,7 +1,6 @@
 """Viewer screen: fullscreen HDR photo display with debug overlay."""
 
 import time
-from enum import Enum, auto
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -13,21 +12,6 @@ from hdr_pipeline import (
     process_sdr_native_to_xrgb2101010,
 )
 import ultrahdr
-
-
-class RenderMode(Enum):
-    HDR_PQ = auto()      # gain map + sRGB->linear->BT.2020->PQ (full HDR pipeline)
-    SDR_PQ = auto()      # no gain map, sRGB->linear->BT.2020->PQ (see PQ/gamut effect)
-    SDR_NATIVE = auto()  # raw sRGB packed to 10-bit, no transform (normal viewer)
-
-
-_RENDER_MODE_LABELS = {
-    RenderMode.HDR_PQ: "HDR PQ",
-    RenderMode.SDR_PQ: "SDR PQ",
-    RenderMode.SDR_NATIVE: "SDR Native",
-}
-
-_RENDER_MODE_CYCLE = [RenderMode.HDR_PQ, RenderMode.SDR_PQ, RenderMode.SDR_NATIVE]
 
 
 class ViewerScreen:
@@ -43,10 +27,10 @@ class ViewerScreen:
         self._last_advance_time = 0.0
         self._cached_index = -1
         self._cached_pixels = None
-        self._cached_render_mode = None
+        self._cached_gain_map = None
         self._cached_tv_hdr = None
         self.debug_mode = False
-        self.render_mode = RenderMode.HDR_PQ
+        self.gain_map_enabled = True
         self._tv_hdr_active = True
 
         self._font = None
@@ -87,22 +71,16 @@ class ViewerScreen:
         self._cached_index = -1
         print(f"Debug overlay {'ON' if self.debug_mode else 'OFF'}")
 
-    def cycle_render_mode(self):
-        """Cycle through render modes: HDR PQ -> SDR PQ -> SDR Native."""
-        idx = _RENDER_MODE_CYCLE.index(self.render_mode)
-        self.render_mode = _RENDER_MODE_CYCLE[(idx + 1) % len(_RENDER_MODE_CYCLE)]
+    def toggle_gain_map(self):
+        """Toggle gain map usage on/off."""
+        self.gain_map_enabled = not self.gain_map_enabled
         self._cached_index = -1
-        print(f"Render mode: {_RENDER_MODE_LABELS[self.render_mode]}")
-
-    @property
-    def render_mode_label(self):
-        return _RENDER_MODE_LABELS[self.render_mode]
+        print(f"Gain map: {'ON' if self.gain_map_enabled else 'OFF'}")
 
     def set_tv_mode(self, hdr_active: bool):
-        """Update TV mode state. Invalidates cache if debug overlay is on."""
+        """Update TV mode state. Always invalidates cache since render path changes."""
         self._tv_hdr_active = hdr_active
-        if self.debug_mode:
-            self._cached_index = -1
+        self._cached_index = -1
 
     def tick(self) -> bool:
         """Check if slideshow should advance. Returns True if photo changed."""
@@ -148,24 +126,36 @@ class ViewerScreen:
         photo._icc_description = desc
         return desc
 
+    def _render_mode_label(self) -> str:
+        """Describe current effective render path."""
+        if not self._tv_hdr_active:
+            return "SDR Native"
+        return "HDR PQ" if self.gain_map_enabled else "SDR PQ"
+
     def render_hdr(self) -> np.ndarray:
         """Render current photo as XRGB2101010 pixels."""
         cache_key_match = (
             self._cached_index == self.current_index
             and self._cached_pixels is not None
-            and self._cached_render_mode == self.render_mode
+            and self._cached_gain_map == self.gain_map_enabled
             and self._cached_tv_hdr == self._tv_hdr_active
         )
         if cache_key_match:
             return self._cached_pixels
 
         photo = self.source[self.current_index]
-        print(f"Rendering: {photo.filename} (Render: {_RENDER_MODE_LABELS[self.render_mode]})")
+        print(f"Rendering: {photo.filename} ({self._render_mode_label()})")
 
         output = np.zeros((self.display_height, self.display_width), dtype=np.uint32)
 
-        if self.render_mode == RenderMode.HDR_PQ and photo.is_ultrahdr:
-            # Full HDR pipeline with gain map
+        if not self._tv_hdr_active:
+            # SDR TV mode: raw sRGB packed to 10-bit, no transform
+            sdr = self.source.load_sdr(self.current_index)
+            fitted = self._fit_image(sdr)
+            photo_pixels = process_sdr_native_to_xrgb2101010(fitted)
+
+        elif self.gain_map_enabled and photo.is_ultrahdr:
+            # HDR TV + gain map: full HDR pipeline
             img = self.source.load_ultrahdr(self.current_index)
 
             fitted_sdr = self._fit_image(img.sdr)
@@ -184,14 +174,8 @@ class ViewerScreen:
 
             photo_pixels = process_to_xrgb2101010(fitted_img)
 
-        elif self.render_mode == RenderMode.SDR_NATIVE:
-            # Raw sRGB packed to 10-bit, no transform
-            sdr = self.source.load_sdr(self.current_index)
-            fitted = self._fit_image(sdr)
-            photo_pixels = process_sdr_native_to_xrgb2101010(fitted)
-
         else:
-            # SDR_PQ, or HDR_PQ with non-Ultra-HDR photo: sRGB->linear->BT.2020->PQ
+            # HDR TV + no gain map (or non-Ultra-HDR photo): sRGB->linear->BT.2020->PQ
             sdr = self.source.load_sdr(self.current_index)
             fitted = self._fit_image(sdr)
             photo_pixels = process_sdr_to_xrgb2101010(fitted)
@@ -207,7 +191,7 @@ class ViewerScreen:
 
         self._cached_index = self.current_index
         self._cached_pixels = output
-        self._cached_render_mode = self.render_mode
+        self._cached_gain_map = self.gain_map_enabled
         self._cached_tv_hdr = self._tv_hdr_active
         return output
 
@@ -236,11 +220,12 @@ class ViewerScreen:
 
         uhdr_str = "Ultra HDR" if photo.is_ultrahdr else "SDR photo"
         icc_str = self._extract_icc_profile(photo)
-        render_str = _RENDER_MODE_LABELS[self.render_mode]
+        render_str = self._render_mode_label()
+        gm_str = "ON" if self.gain_map_enabled else "OFF"
         tv_str = "HDR10" if self._tv_hdr_active else "SDR"
 
         text = (f"{photo.filename}  |  {uhdr_str}  |  Profile: {icc_str}"
-                f"  |  Render: {render_str}  |  TV: {tv_str}")
+                f"  |  Gain map: {gm_str}  |  Render: {render_str}  |  TV: {tv_str}")
 
         draw.text((20, 14), text, fill=(200, 200, 200), font=self._font)
 
