@@ -411,6 +411,7 @@ class DRMDisplay:
         self._mode_blob_id = 0
         self._saved_crtc = None
         self._atomic = False
+        self._hdr_active = False
 
     def open(self):
         """Open DRM device and find connected HDMI output."""
@@ -872,6 +873,8 @@ class DRMDisplay:
         self._hdr_blob_id = blob.blob_id
         print(f"HDR metadata blob created (blob_id={blob.blob_id})")
 
+        self._hdr_active = True
+
         if not self._atomic:
             self.set_connector_property("max bpc", 10)
             self.set_connector_property("HDR_OUTPUT_METADATA", blob.blob_id)
@@ -909,7 +912,47 @@ class DRMDisplay:
                 pass
             self._hdr_blob_id = 0
 
+        self._hdr_active = False
         print("HDR disabled")
+
+    def set_hdr_enabled(self, enabled: bool):
+        """Toggle HDR on/off at runtime without destroying the metadata blob.
+
+        Unlike disable_hdr(), this preserves the blob so we can toggle back.
+        The TV will briefly black out during HDMI InfoFrame renegotiation.
+        """
+        if enabled == self._hdr_active:
+            return
+
+        max_bpc_prop = self._get_prop_id(self.connector_id, DRM_MODE_OBJECT_CONNECTOR, "max bpc")
+        hdr_prop = self._get_prop_id(self.connector_id, DRM_MODE_OBJECT_CONNECTOR, "HDR_OUTPUT_METADATA")
+
+        conn_props = []
+        if enabled:
+            if hdr_prop and self._hdr_blob_id:
+                conn_props.append((hdr_prop, self._hdr_blob_id))
+            if max_bpc_prop:
+                conn_props.append((max_bpc_prop, 10))
+        else:
+            if hdr_prop:
+                conn_props.append((hdr_prop, 0))
+            if max_bpc_prop:
+                conn_props.append((max_bpc_prop, 8))
+
+        if conn_props:
+            if self._atomic:
+                self._atomic_commit({self.connector_id: conn_props})
+            else:
+                for prop_id, value in conn_props:
+                    set_prop = drm_mode_obj_set_property()
+                    set_prop.value = value
+                    set_prop.prop_id = prop_id
+                    set_prop.obj_id = self.connector_id
+                    set_prop.obj_type = DRM_MODE_OBJECT_CONNECTOR
+                    _ioctl(self.fd, DRM_IOCTL_MODE_OBJ_SETPROPERTY, set_prop)
+
+        self._hdr_active = enabled
+        print(f"HDR {'enabled' if enabled else 'disabled'} (runtime toggle)")
 
     def close(self):
         """Clean up DRM resources."""

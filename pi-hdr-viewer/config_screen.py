@@ -7,7 +7,7 @@ from dataclasses import dataclass, asdict
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from hdr_pipeline import process_sdr_to_xrgb2101010
+from hdr_pipeline import process_sdr_to_xrgb2101010, process_sdr_native_to_xrgb2101010
 
 
 CONFIG_DIR = os.path.expanduser("~/.config/hdr-viewer")
@@ -117,3 +117,7 @@ class ConfigScreen:
 
     def render_hdr(self) -> np.ndarray:
         return process_sdr_to_xrgb2101010(self._render_canvas())
+
+    def render_native(self) -> np.ndarray:
+        """Render config as XRGB2101010 raw sRGB (for SDR TV mode)."""
+        return process_sdr_native_to_xrgb2101010(self._render_canvas())

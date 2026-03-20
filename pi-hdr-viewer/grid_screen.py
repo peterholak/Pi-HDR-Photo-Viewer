@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from photo_source import PhotoSource
-from hdr_pipeline import process_sdr_to_xrgb2101010
+from hdr_pipeline import process_sdr_to_xrgb2101010, process_sdr_native_to_xrgb2101010
 
 
 # Grid layout constants
@@ -165,3 +165,7 @@ class GridScreen:
     def render_hdr(self) -> np.ndarray:
         """Render the grid as XRGB2101010 PQ BT.2020."""
         return process_sdr_to_xrgb2101010(self._render_canvas())
+
+    def render_native(self) -> np.ndarray:
+        """Render the grid as XRGB2101010 raw sRGB (for SDR TV mode)."""
+        return process_sdr_native_to_xrgb2101010(self._render_canvas())

@@ -14,7 +14,8 @@ Controls:
     Space       -- toggle slideshow
     C           -- open config screen
     D           -- toggle debug overlay (viewer)
-    G           -- toggle SDR/HDR mode (viewer)
+    G           -- cycle render pipeline: HDR PQ / SDR PQ / SDR Native
+    H           -- toggle TV between HDR10 and SDR
     Q           -- quit
 """
 
@@ -26,11 +27,15 @@ import sys
 import time
 from enum import Enum, auto
 
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
 from drm_display import DRMDisplay, DRM_FORMAT_XRGB2101010
 from photo_source import PhotoSource
 from grid_screen import GridScreen
 from viewer_screen import ViewerScreen
 from config_screen import AppConfig, ConfigScreen
+from hdr_pipeline import process_sdr_to_xrgb2101010, process_sdr_native_to_xrgb2101010
 
 
 # -- Linux input event constants --
@@ -42,6 +47,7 @@ EV_KEY = 0x01
 
 KEY_ESC = 1
 KEY_Q = 16
+KEY_H = 35
 KEY_D = 32
 KEY_G = 34
 KEY_C = 46
@@ -105,6 +111,7 @@ CMD_TO_KEY = {
     "c": KEY_C, "config": KEY_C,
     "d": KEY_D, "debug": KEY_D,
     "g": KEY_G, "gainmap": KEY_G,
+    "h": KEY_H, "hdr": KEY_H,
 }
 
 
@@ -243,6 +250,52 @@ class InputHandler:
             pass
 
 
+# -- Toast notification --
+
+TOAST_DURATION = 2.0
+
+
+def _find_toast_font():
+    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+               "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+               "/usr/share/fonts/TTF/DejaVuSans.ttf"]:
+        try:
+            return ImageFont.truetype(fp, 28)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def render_toast(message: str, width: int, font: ImageFont.ImageFont,
+                 hdr_mode: bool) -> np.ndarray:
+    """Render a toast bar (~50px tall) centered at the top of the screen.
+
+    Returns XRGB2101010 pixels of shape (bar_height, width).
+    """
+    bar_height = 50
+    img = Image.new("RGB", (width, bar_height), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Measure text to center it
+    bbox = draw.textbbox((0, 0), message, font=font)
+    tw = bbox[2] - bbox[0]
+    # Draw dark background pill
+    pad_x = 30
+    pill_x0 = (width - tw) // 2 - pad_x
+    pill_x1 = (width + tw) // 2 + pad_x
+    draw.rounded_rectangle([pill_x0, 4, pill_x1, bar_height - 4],
+                           radius=10, fill=(40, 40, 40))
+    # Draw text
+    tx = (width - tw) // 2
+    draw.text((tx, 12), message, fill=(230, 230, 230), font=font)
+
+    if hdr_mode:
+        return process_sdr_to_xrgb2101010(img)
+    else:
+        return process_sdr_native_to_xrgb2101010(img)
+
+
 def main():
     if len(sys.argv) > 1:
         photo_dir = sys.argv[1]
@@ -283,6 +336,16 @@ def main():
     display.enable_hdr()
     display.set_mode(fb, hdr_blob_id=display._hdr_blob_id)
 
+    # Toast state
+    toast_message = ""
+    toast_time = 0.0
+    toast_font = _find_toast_font()
+
+    def show_toast(msg: str):
+        nonlocal toast_message, toast_time
+        toast_message = msg
+        toast_time = time.monotonic()
+
     def enter_grid():
         nonlocal state, needs_render
         state = AppState.GRID
@@ -317,12 +380,17 @@ def main():
     enter_grid()
 
     print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
-    print("  C: config   D: debug overlay   G: toggle gain map")
+    print("  C: config   D: debug overlay   G: cycle render   H: toggle HDR/SDR")
 
     try:
         while True:
             if state == AppState.VIEWER and viewer.tick():
                 needs_render = True
+
+            # Check toast expiry
+            if toast_message and (time.monotonic() - toast_time) >= TOAST_DURATION:
+                toast_message = ""
+                needs_render = True  # Re-render to clear toast
 
             key_events = input_handler.poll(timeout=0.05)
 
@@ -344,6 +412,12 @@ def main():
                         enter_viewer(grid.selected)
                     elif key_code == KEY_C:
                         enter_config()
+                    elif key_code == KEY_H:
+                        new_hdr = not display._hdr_active
+                        display.set_hdr_enabled(new_hdr)
+                        viewer.set_tv_mode(new_hdr)
+                        needs_render = True
+                        show_toast(f"TV: {'HDR10' if new_hdr else 'SDR'}")
                     elif key_code in (KEY_ESC, KEY_EXIT, KEY_Q):
                         raise KeyboardInterrupt
 
@@ -358,12 +432,21 @@ def main():
                         needs_render = True
                     elif key_code in (KEY_SPACE, KEY_PLAYPAUSE):
                         viewer.toggle_slideshow()
+                        show_toast(f"Slideshow: {'ON' if viewer.slideshow_active else 'OFF'}")
                     elif key_code == KEY_D:
                         viewer.toggle_debug()
                         needs_render = True
+                        show_toast(f"Debug: {'ON' if viewer.debug_mode else 'OFF'}")
                     elif key_code == KEY_G:
-                        viewer.toggle_sdr_mode()
+                        viewer.cycle_render_mode()
                         needs_render = True
+                        show_toast(f"Render: {viewer.render_mode_label}")
+                    elif key_code == KEY_H:
+                        new_hdr = not display._hdr_active
+                        display.set_hdr_enabled(new_hdr)
+                        viewer.set_tv_mode(new_hdr)
+                        needs_render = True
+                        show_toast(f"TV: {'HDR10' if new_hdr else 'SDR'}")
                     elif key_code == KEY_Q:
                         raise KeyboardInterrupt
 
@@ -382,17 +465,24 @@ def main():
                     elif key_code == KEY_RIGHT:
                         config_screen.change_value(1)
                         needs_render = True
+                    elif key_code == KEY_H:
+                        new_hdr = not display._hdr_active
+                        display.set_hdr_enabled(new_hdr)
+                        viewer.set_tv_mode(new_hdr)
+                        needs_render = True
+                        show_toast(f"TV: {'HDR10' if new_hdr else 'SDR'}")
                     elif key_code == KEY_Q:
                         raise KeyboardInterrupt
 
             if needs_render:
                 t0 = time.monotonic()
+                hdr_active = display._hdr_active
                 if state == AppState.GRID:
-                    pixels = grid.render_hdr()
+                    pixels = grid.render_hdr() if hdr_active else grid.render_native()
                 elif state == AppState.VIEWER:
                     pixels = viewer.render_hdr()
                 elif state == AppState.CONFIG:
-                    pixels = config_screen.render_hdr()
+                    pixels = config_screen.render_hdr() if hdr_active else config_screen.render_native()
                 t1 = time.monotonic()
 
                 mm = fb.mmap_buffer()
@@ -404,6 +494,20 @@ def main():
                         mm.seek(y * fb.pitch)
                         mm.write(pixels[y].tobytes())
                 t2 = time.monotonic()
+
+                # Overlay toast if active
+                if toast_message and (time.monotonic() - toast_time) < TOAST_DURATION:
+                    toast_pixels = render_toast(toast_message, display.width,
+                                                toast_font, hdr_active)
+                    toast_h = toast_pixels.shape[0]
+                    mm.seek(0)
+                    if fb.pitch == display.width * 4:
+                        mm.write(toast_pixels.tobytes())
+                    else:
+                        for y in range(toast_h):
+                            mm.seek(y * fb.pitch)
+                            mm.write(toast_pixels[y].tobytes())
+
                 print(f"  render: {t1-t0:.2f}s, write: {t2-t1:.2f}s")
 
                 needs_render = False

@@ -249,6 +249,26 @@ def process_sdr_to_xrgb2101010(image: Image.Image) -> np.ndarray:
     return (pq10[:, :, 0] << 20) | (pq10[:, :, 1] << 10) | pq10[:, :, 2]
 
 
+def process_sdr_native_to_xrgb2101010(image: Image.Image) -> np.ndarray:
+    """Pack raw sRGB 8-bit values into 10-bit XRGB2101010 with NO color transform.
+
+    No EOTF, no BT.2020 matrix, no PQ. Just 8→10 bit expansion:
+    (val << 2) | (val >> 6) maps 0→0, 255→1023.
+    This is what a normal SDR viewer does, just bit-expanded to fit XRGB2101010.
+    """
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    arr = np.array(image, dtype=np.uint32)  # (H, W, 3)
+
+    # 8→10 bit expansion: maps 0→0, 255→1023
+    r10 = (arr[:, :, 0] << 2) | (arr[:, :, 0] >> 6)
+    g10 = (arr[:, :, 1] << 2) | (arr[:, :, 1] >> 6)
+    b10 = (arr[:, :, 2] << 2) | (arr[:, :, 2] >> 6)
+
+    return (r10 << 20) | (g10 << 10) | b10
+
+
 def process_sdr_to_xrgb8888(image: Image.Image, target_width: int = 0,
                              target_height: int = 0) -> np.ndarray:
     """Convert an SDR PIL Image to XRGB8888 packed pixels.

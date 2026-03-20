@@ -1,12 +1,33 @@
 """Viewer screen: fullscreen HDR photo display with debug overlay."""
 
 import time
+from enum import Enum, auto
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from photo_source import PhotoSource
-from hdr_pipeline import process_to_xrgb2101010, process_sdr_to_xrgb8888, process_sdr_to_xrgb2101010
+from hdr_pipeline import (
+    process_to_xrgb2101010,
+    process_sdr_to_xrgb2101010,
+    process_sdr_native_to_xrgb2101010,
+)
 import ultrahdr
+
+
+class RenderMode(Enum):
+    HDR_PQ = auto()      # gain map + sRGB->linear->BT.2020->PQ (full HDR pipeline)
+    SDR_PQ = auto()      # no gain map, sRGB->linear->BT.2020->PQ (see PQ/gamut effect)
+    SDR_NATIVE = auto()  # raw sRGB packed to 10-bit, no transform (normal viewer)
+
+
+_RENDER_MODE_LABELS = {
+    RenderMode.HDR_PQ: "HDR PQ",
+    RenderMode.SDR_PQ: "SDR PQ",
+    RenderMode.SDR_NATIVE: "SDR Native",
+}
+
+_RENDER_MODE_CYCLE = [RenderMode.HDR_PQ, RenderMode.SDR_PQ, RenderMode.SDR_NATIVE]
 
 
 class ViewerScreen:
@@ -22,8 +43,11 @@ class ViewerScreen:
         self._last_advance_time = 0.0
         self._cached_index = -1
         self._cached_pixels = None
+        self._cached_render_mode = None
+        self._cached_tv_hdr = None
         self.debug_mode = False
-        self.show_as_sdr = False
+        self.render_mode = RenderMode.HDR_PQ
+        self._tv_hdr_active = True
 
         self._font = None
         try:
@@ -63,11 +87,22 @@ class ViewerScreen:
         self._cached_index = -1
         print(f"Debug overlay {'ON' if self.debug_mode else 'OFF'}")
 
-    def toggle_sdr_mode(self):
-        """Toggle SDR/HDR rendering mode."""
-        self.show_as_sdr = not self.show_as_sdr
+    def cycle_render_mode(self):
+        """Cycle through render modes: HDR PQ -> SDR PQ -> SDR Native."""
+        idx = _RENDER_MODE_CYCLE.index(self.render_mode)
+        self.render_mode = _RENDER_MODE_CYCLE[(idx + 1) % len(_RENDER_MODE_CYCLE)]
         self._cached_index = -1
-        print(f"Render mode: {'SDR (gain map off)' if self.show_as_sdr else 'HDR'}")
+        print(f"Render mode: {_RENDER_MODE_LABELS[self.render_mode]}")
+
+    @property
+    def render_mode_label(self):
+        return _RENDER_MODE_LABELS[self.render_mode]
+
+    def set_tv_mode(self, hdr_active: bool):
+        """Update TV mode state. Invalidates cache if debug overlay is on."""
+        self._tv_hdr_active = hdr_active
+        if self.debug_mode:
+            self._cached_index = -1
 
     def tick(self) -> bool:
         """Check if slideshow should advance. Returns True if photo changed."""
@@ -92,17 +127,45 @@ class ViewerScreen:
             return img
         return img.resize((new_w, new_h), Image.LANCZOS)
 
+    def _extract_icc_profile(self, photo) -> str:
+        """Extract ICC profile description from photo, cached on PhotoInfo."""
+        if hasattr(photo, '_icc_description'):
+            return photo._icc_description
+
+        desc = "sRGB (assumed)"
+        try:
+            from PIL import ImageCms
+            sdr = self.source.load_sdr(self.current_index)
+            icc_data = sdr.info.get("icc_profile")
+            if icc_data:
+                profile = ImageCms.ImageCmsProfile(ImageCms.core.profile_frombytes(icc_data))
+                name = ImageCms.getProfileDescription(profile)
+                if name:
+                    desc = f"{name.strip()} (not applied)"
+        except Exception:
+            pass
+
+        photo._icc_description = desc
+        return desc
+
     def render_hdr(self) -> np.ndarray:
-        """Render current photo as XRGB2101010 HDR pixels."""
-        if self._cached_index == self.current_index and self._cached_pixels is not None:
+        """Render current photo as XRGB2101010 pixels."""
+        cache_key_match = (
+            self._cached_index == self.current_index
+            and self._cached_pixels is not None
+            and self._cached_render_mode == self.render_mode
+            and self._cached_tv_hdr == self._tv_hdr_active
+        )
+        if cache_key_match:
             return self._cached_pixels
 
         photo = self.source[self.current_index]
-        print(f"Rendering: {photo.filename} ({'SDR mode' if self.show_as_sdr else 'HDR'})")
+        print(f"Rendering: {photo.filename} (Render: {_RENDER_MODE_LABELS[self.render_mode]})")
 
         output = np.zeros((self.display_height, self.display_width), dtype=np.uint32)
 
-        if photo.is_ultrahdr and not self.show_as_sdr:
+        if self.render_mode == RenderMode.HDR_PQ and photo.is_ultrahdr:
+            # Full HDR pipeline with gain map
             img = self.source.load_ultrahdr(self.current_index)
 
             fitted_sdr = self._fit_image(img.sdr)
@@ -120,18 +183,18 @@ class ViewerScreen:
             )
 
             photo_pixels = process_to_xrgb2101010(fitted_img)
-        else:
+
+        elif self.render_mode == RenderMode.SDR_NATIVE:
+            # Raw sRGB packed to 10-bit, no transform
             sdr = self.source.load_sdr(self.current_index)
             fitted = self._fit_image(sdr)
+            photo_pixels = process_sdr_native_to_xrgb2101010(fitted)
 
-            dummy = ultrahdr.UltraHDRImage(
-                sdr=fitted,
-                gain_map=None,
-                params=ultrahdr.GainMapParams(),
-                width=fitted.width,
-                height=fitted.height,
-            )
-            photo_pixels = process_to_xrgb2101010(dummy)
+        else:
+            # SDR_PQ, or HDR_PQ with non-Ultra-HDR photo: sRGB->linear->BT.2020->PQ
+            sdr = self.source.load_sdr(self.current_index)
+            fitted = self._fit_image(sdr)
+            photo_pixels = process_sdr_to_xrgb2101010(fitted)
 
         # Center in output (letterbox/pillarbox)
         ph, pw = photo_pixels.shape
@@ -144,10 +207,13 @@ class ViewerScreen:
 
         self._cached_index = self.current_index
         self._cached_pixels = output
+        self._cached_render_mode = self.render_mode
+        self._cached_tv_hdr = self._tv_hdr_active
         return output
 
     def render_sdr(self) -> np.ndarray:
         """Render current photo as XRGB8888 SDR pixels (fallback)."""
+        from hdr_pipeline import process_sdr_to_xrgb8888
         photo = self.source[self.current_index]
         sdr = self.source.load_sdr(self.current_index)
         fitted = self._fit_image(sdr)
@@ -168,13 +234,21 @@ class ViewerScreen:
         overlay = Image.new("RGB", (self.display_width, bar_height), (30, 30, 30))
         draw = ImageDraw.Draw(overlay)
 
-        mode_str = "SDR (gain map off)" if self.show_as_sdr else "HDR"
         uhdr_str = "Ultra HDR" if photo.is_ultrahdr else "SDR photo"
-        text = (f"{photo.filename}  |  {uhdr_str}  |  Mode: {mode_str}"
-                f"  |  [D] overlay  [G] toggle gain map")
+        icc_str = self._extract_icc_profile(photo)
+        render_str = _RENDER_MODE_LABELS[self.render_mode]
+        tv_str = "HDR10" if self._tv_hdr_active else "SDR"
+
+        text = (f"{photo.filename}  |  {uhdr_str}  |  Profile: {icc_str}"
+                f"  |  Render: {render_str}  |  TV: {tv_str}")
 
         draw.text((20, 14), text, fill=(200, 200, 200), font=self._font)
 
-        overlay_pixels = process_sdr_to_xrgb2101010(overlay)
+        # Overlay rendering follows TV mode so text is always legible
+        if self._tv_hdr_active:
+            overlay_pixels = process_sdr_to_xrgb2101010(overlay)
+        else:
+            overlay_pixels = process_sdr_native_to_xrgb2101010(overlay)
+
         y = self.display_height - bar_height
         output[y:, :] = overlay_pixels
