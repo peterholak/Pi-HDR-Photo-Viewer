@@ -23,6 +23,7 @@ Controls:
     Q           -- quit
 """
 
+import fcntl
 import os
 import select
 import signal
@@ -143,12 +144,17 @@ def setup_cec():
         print("CEC: setup timed out")
 
 
+# EVIOCGRAB ioctl: _IOW('E', 0x90, int) = 0x40044590
+EVIOCGRAB = 0x40044590
+
+
 class InputHandler:
     """Reads keyboard events from /dev/input/event* and a command pipe."""
 
     def __init__(self, cmd_pipe_path=None):
         self.fds = []
         self.files = []
+        self._grabbed = []  # file objects with exclusive grab
         self._pipe_file = None
 
         setup_cec()
@@ -159,6 +165,12 @@ class InputHandler:
                 f = open(path, "rb", buffering=0)
                 self.fds.append(f.fileno())
                 self.files.append(f)
+                # Grab exclusive access so keys don't leak to the console
+                try:
+                    fcntl.ioctl(f.fileno(), EVIOCGRAB, 1)
+                    self._grabbed.append(f)
+                except OSError:
+                    pass
                 print(f"Opened input device: {path}")
             except PermissionError:
                 print(f"Warning: no permission for {path} (run as root or add to 'input' group)")
@@ -243,6 +255,12 @@ class InputHandler:
             self._pipe_file = None
 
     def close(self):
+        for f in self._grabbed:
+            try:
+                fcntl.ioctl(f.fileno(), EVIOCGRAB, 0)
+            except OSError:
+                pass
+        self._grabbed.clear()
         for f in self.files:
             try:
                 f.close()
