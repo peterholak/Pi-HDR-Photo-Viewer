@@ -30,8 +30,10 @@ class ViewerScreen:
         self._cached_pixels = None
         self._cached_gain_map = None
         self._cached_tv_hdr = None
+        self._cached_gm_view = None
         self.debug_mode = False
         self.gain_map_enabled = True
+        self.show_gainmap_view = False
         self._tv_hdr_active = True
 
         self._font = None
@@ -75,8 +77,15 @@ class ViewerScreen:
     def toggle_gain_map(self):
         """Toggle gain map usage on/off."""
         self.gain_map_enabled = not self.gain_map_enabled
+        self.show_gainmap_view = False
         self._cached_index = -1
         print(f"Gain map: {'ON' if self.gain_map_enabled else 'OFF'}")
+
+    def toggle_gainmap_view(self):
+        """Toggle showing the raw gain map as grayscale."""
+        self.show_gainmap_view = not self.show_gainmap_view
+        self._cached_index = -1
+        print(f"Gain map view: {'ON' if self.show_gainmap_view else 'OFF'}")
 
     def set_tv_mode(self, hdr_active: bool):
         """Update TV mode state. Always invalidates cache since render path changes.
@@ -134,10 +143,24 @@ class ViewerScreen:
 
     def _render_mode_label(self) -> str:
         """Describe current effective render path."""
+        if self.show_gainmap_view:
+            return "Gain Map View"
         if self._tv_hdr_active:
             return "HDR PQ" if self.gain_map_enabled else "SDR PQ"
         else:
             return "SDR Tonemap" if self.gain_map_enabled else "SDR Native"
+
+    def _render_gainmap_grayscale(self, photo):
+        """Render the raw gain map as a grayscale image, fitted to display."""
+        if not photo.is_ultrahdr:
+            return None
+        img = self.source.load_ultrahdr(self.current_index)
+        if img.gain_map is None:
+            return None
+        fitted_sdr = self._fit_image(img.sdr)
+        gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+        # Convert L grayscale to RGB for pipeline
+        return gm.convert("RGB")
 
     def render_hdr(self) -> np.ndarray:
         """Render current photo as XRGB2101010 pixels."""
@@ -146,6 +169,7 @@ class ViewerScreen:
             and self._cached_pixels is not None
             and self._cached_gain_map == self.gain_map_enabled
             and self._cached_tv_hdr == self._tv_hdr_active
+            and self._cached_gm_view == self.show_gainmap_view
         )
         if cache_key_match:
             return self._cached_pixels
@@ -155,7 +179,17 @@ class ViewerScreen:
 
         output = np.zeros((self.display_height, self.display_width), dtype=np.uint32)
 
-        if not self._tv_hdr_active and self.gain_map_enabled and photo.is_ultrahdr:
+        if self.show_gainmap_view and photo.is_ultrahdr:
+            gm_rgb = self._render_gainmap_grayscale(photo)
+            if gm_rgb is not None:
+                if self._tv_hdr_active:
+                    photo_pixels = process_sdr_to_xrgb2101010(gm_rgb)
+                else:
+                    photo_pixels = process_sdr_native_to_xrgb2101010(gm_rgb)
+            else:
+                photo_pixels = np.zeros((1, 1), dtype=np.uint32)
+
+        elif not self._tv_hdr_active and self.gain_map_enabled and photo.is_ultrahdr:
             # SDR TV + gain map: tone-mapped gain map → sRGB → native 10-bit
             img = self.source.load_ultrahdr(self.current_index)
 
@@ -220,6 +254,7 @@ class ViewerScreen:
         self._cached_pixels = output
         self._cached_gain_map = self.gain_map_enabled
         self._cached_tv_hdr = self._tv_hdr_active
+        self._cached_gm_view = self.show_gainmap_view
         return output
 
     def render_to_gpu(self, gpu):
@@ -233,12 +268,31 @@ class ViewerScreen:
             and self._cached_pixels is not None
             and self._cached_gain_map == self.gain_map_enabled
             and self._cached_tv_hdr == self._tv_hdr_active
+            and self._cached_gm_view == self.show_gainmap_view
         )
         if cache_key_match:
             return  # Already rendered and SSBO still has the data
 
         photo = self.source[self.current_index]
         print(f"Rendering [GPU]: {photo.filename} ({self._render_mode_label()})")
+
+        if self.show_gainmap_view and photo.is_ultrahdr:
+            gm_rgb = self._render_gainmap_grayscale(photo)
+            if gm_rgb is not None:
+                pw, ph = gm_rgb.size
+                x_offset = (self.display_width - pw) // 2
+                y_offset = (self.display_height - ph) // 2
+                if self._tv_hdr_active:
+                    gpu.render_sdr(gm_rgb, pw, ph, x_offset, y_offset)
+                else:
+                    gpu.render_native(gm_rgb, pw, ph, x_offset, y_offset)
+
+            self._cached_index = self.current_index
+            self._cached_pixels = True
+            self._cached_gain_map = self.gain_map_enabled
+            self._cached_tv_hdr = self._tv_hdr_active
+            self._cached_gm_view = self.show_gainmap_view
+            return
 
         use_gainmap = self.gain_map_enabled and photo.is_ultrahdr
 
@@ -277,6 +331,7 @@ class ViewerScreen:
         self._cached_pixels = True  # Sentinel: SSBO has the data
         self._cached_gain_map = self.gain_map_enabled
         self._cached_tv_hdr = self._tv_hdr_active
+        self._cached_gm_view = self.show_gainmap_view
 
     def render_sdr(self) -> np.ndarray:
         """Render current photo as XRGB8888 SDR pixels (fallback)."""

@@ -19,6 +19,7 @@ Controls:
     D           -- toggle debug overlay (viewer)
     G           -- toggle gain map on/off (viewer)
     H           -- toggle TV HDR10/SDR (switches render pipeline too)
+    M           -- show raw gain map as grayscale (viewer)
     Q           -- quit
 """
 
@@ -53,6 +54,7 @@ KEY_Q = 16
 KEY_H = 35
 KEY_D = 32
 KEY_G = 34
+KEY_M = 50
 KEY_C = 46
 KEY_ENTER = 28
 KEY_SPACE = 57
@@ -115,6 +117,7 @@ CMD_TO_KEY = {
     "d": KEY_D, "debug": KEY_D,
     "g": KEY_G, "gainmap": KEY_G,
     "h": KEY_H, "hdr": KEY_H,
+    "m": KEY_M, "map": KEY_M,
 }
 
 
@@ -409,7 +412,7 @@ def main():
     enter_grid()
 
     print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
-    print("  C: config   D: debug overlay   G: toggle gain map   H: toggle HDR/SDR")
+    print("  C: config   D: debug   G: gain map   H: HDR/SDR   M: show gain map")
 
     try:
         while True:
@@ -470,6 +473,10 @@ def main():
                         viewer.toggle_gain_map()
                         needs_render = True
                         show_toast(f"Gain map: {'ON' if viewer.gain_map_enabled else 'OFF'}")
+                    elif key_code == KEY_M:
+                        viewer.toggle_gainmap_view()
+                        needs_render = True
+                        show_toast(f"Gain map view: {'ON' if viewer.show_gainmap_view else 'OFF'}")
                     elif key_code == KEY_H:
                         new_hdr = not display._hdr_active
                         display.set_hdr_enabled(new_hdr)
