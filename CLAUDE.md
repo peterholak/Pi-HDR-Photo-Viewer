@@ -8,5 +8,7 @@
 
 ## Running on Pi
 
-- Requires root (or `input` group) for DRM/KMS and evdev access
-- Run: `sudo python3 /home/haro/photo-hdr/pi-hdr-viewer/main.py [photo_dir]`
+- User `haro` is in `video` and `input` groups — no sudo needed
+- Run: `python3 -u /home/haro/photo-hdr/pi-hdr-viewer/main.py [photo_dir]`
+- Use `-u` flag for unbuffered output when redirecting to a log file
+- Quit via pipe: `echo q > /tmp/hdr-viewer-cmd`
