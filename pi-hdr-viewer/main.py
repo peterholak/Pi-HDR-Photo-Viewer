@@ -20,6 +20,7 @@ Controls:
 
 import os
 import select
+import signal
 import struct
 import sys
 import time
@@ -159,11 +160,14 @@ class InputHandler:
 
         pipe_path = cmd_pipe_path or "/tmp/hdr-viewer-cmd"
         try:
-            if os.path.exists(pipe_path):
+            try:
                 os.unlink(pipe_path)
-            old_umask = os.umask(0)
-            os.mkfifo(pipe_path, 0o666)
-            os.umask(old_umask)
+            except OSError:
+                pass
+            if not os.path.exists(pipe_path):
+                old_umask = os.umask(0)
+                os.mkfifo(pipe_path, 0o666)
+                os.umask(old_umask)
             pipe_fd = os.open(pipe_path, os.O_RDONLY | os.O_NONBLOCK)
             self._pipe_file = os.fdopen(pipe_fd, "r")
             self.fds.append(self._pipe_file.fileno())
@@ -310,6 +314,12 @@ def main():
         viewer.slideshow_interval = config.slideshow_interval
         viewer.debug_mode = config.debug_overlay
 
+    # Handle SIGTERM/SIGHUP for clean shutdown (e.g., pkill, SSH disconnect)
+    def _signal_exit(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _signal_exit)
+    signal.signal(signal.SIGHUP, _signal_exit)
+
     enter_grid()
 
     print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
@@ -404,7 +414,7 @@ def main():
 
                 needs_render = False
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print("\nExiting...")
 
     finally:
