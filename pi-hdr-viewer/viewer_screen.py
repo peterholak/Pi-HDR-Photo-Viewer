@@ -79,8 +79,13 @@ class ViewerScreen:
         print(f"Gain map: {'ON' if self.gain_map_enabled else 'OFF'}")
 
     def set_tv_mode(self, hdr_active: bool):
-        """Update TV mode state. Always invalidates cache since render path changes."""
+        """Update TV mode state. Always invalidates cache since render path changes.
+
+        Switching to SDR resets gain map to off so the initial view is plain SDR.
+        """
         self._tv_hdr_active = hdr_active
+        if not hdr_active:
+            self.gain_map_enabled = False
         self._cached_index = -1
 
     def tick(self) -> bool:
