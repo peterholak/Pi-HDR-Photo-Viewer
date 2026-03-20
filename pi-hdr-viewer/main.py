@@ -109,29 +109,23 @@ CMD_TO_KEY = {
 
 
 def setup_cec():
-    """Announce Pi as active CEC source so TV remote events arrive."""
+    """Register as CEC playback device so TV remote events arrive via evdev."""
     import subprocess
     try:
+        # Step 1: Register as playback device (gets a logical address)
         subprocess.run(
-            ["cec-ctl", "--device", "/dev/cec0", "--playback",
-             "--active-source", "phys-addr-from-edid=/sys/class/drm/card1-HDMI-A-1/edid"],
+            ["cec-ctl", "--device", "/dev/cec0", "--playback"],
+            capture_output=True, timeout=5,
+        )
+        # Step 2: Become active source (so TV routes remote to us)
+        subprocess.run(
+            ["cec-ctl", "--device", "/dev/cec0",
+             "--active-source", "phys-addr=3.0.0.0"],
             capture_output=True, timeout=5,
         )
         print("CEC: registered as active source")
     except FileNotFoundError:
-        try:
-            subprocess.run(
-                ["cec-ctl", "--device", "/dev/cec0", "--playback"],
-                capture_output=True, timeout=5,
-            )
-            subprocess.run(
-                ["cec-ctl", "--device", "/dev/cec0",
-                 "--active-source", "phys-addr=3.0.0.0"],
-                capture_output=True, timeout=5,
-            )
-            print("CEC: registered as active source (fallback)")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print("CEC: cec-ctl not available, TV remote may not work")
+        print("CEC: cec-ctl not available, TV remote may not work")
     except subprocess.TimeoutExpired:
         print("CEC: setup timed out")
 
@@ -350,7 +344,7 @@ def main():
                         enter_viewer(grid.selected)
                     elif key_code == KEY_C:
                         enter_config()
-                    elif key_code in (KEY_ESC, KEY_Q):
+                    elif key_code in (KEY_ESC, KEY_EXIT, KEY_Q):
                         raise KeyboardInterrupt
 
                 elif state == AppState.VIEWER:
