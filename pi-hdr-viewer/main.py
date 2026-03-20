@@ -507,14 +507,22 @@ def main():
                 t0 = time.monotonic()
                 hdr_active = display._hdr_active
 
-                if gpu and hdr_active:
-                    # GPU render path (HDR mode only — GPU shader does PQ encoding)
+                if gpu:
+                    # GPU render path
                     if state == AppState.VIEWER:
                         viewer.render_to_gpu(gpu)
                     elif state == AppState.GRID:
-                        gpu.render_fullscreen(grid._render_canvas())
+                        canvas = grid._render_canvas()
+                        if hdr_active:
+                            gpu.render_fullscreen(canvas)
+                        else:
+                            gpu.render_native_fullscreen(canvas)
                     elif state == AppState.CONFIG:
-                        gpu.render_fullscreen(config_screen._render_canvas())
+                        canvas = config_screen._render_canvas()
+                        if hdr_active:
+                            gpu.render_fullscreen(canvas)
+                        else:
+                            gpu.render_native_fullscreen(canvas)
                     t1 = time.monotonic()
 
                     # Debug overlay: read back pixels, apply overlay, write
@@ -535,7 +543,7 @@ def main():
                         gpu.copy_to_framebuffer(fb)
                     t2 = time.monotonic()
                 else:
-                    # CPU render path (also used for SDR TV mode)
+                    # CPU render path (fallback when no GPU)
                     if state == AppState.GRID:
                         pixels = grid.render_hdr() if hdr_active else grid.render_native()
                     elif state == AppState.VIEWER:

@@ -10,6 +10,7 @@ from hdr_pipeline import (
     process_to_xrgb2101010,
     process_sdr_to_xrgb2101010,
     process_sdr_native_to_xrgb2101010,
+    process_gainmap_sdr_to_xrgb2101010,
 )
 import ultrahdr
 
@@ -128,9 +129,10 @@ class ViewerScreen:
 
     def _render_mode_label(self) -> str:
         """Describe current effective render path."""
-        if not self._tv_hdr_active:
-            return "SDR Native"
-        return "HDR PQ" if self.gain_map_enabled else "SDR PQ"
+        if self._tv_hdr_active:
+            return "HDR PQ" if self.gain_map_enabled else "SDR PQ"
+        else:
+            return "SDR Tonemap" if self.gain_map_enabled else "SDR Native"
 
     def render_hdr(self) -> np.ndarray:
         """Render current photo as XRGB2101010 pixels."""
@@ -148,8 +150,28 @@ class ViewerScreen:
 
         output = np.zeros((self.display_height, self.display_width), dtype=np.uint32)
 
-        if not self._tv_hdr_active:
-            # SDR TV mode: raw sRGB packed to 10-bit, no transform
+        if not self._tv_hdr_active and self.gain_map_enabled and photo.is_ultrahdr:
+            # SDR TV + gain map: tone-mapped gain map → sRGB → native 10-bit
+            img = self.source.load_ultrahdr(self.current_index)
+
+            fitted_sdr = self._fit_image(img.sdr)
+            if img.gain_map is not None:
+                fitted_gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+            else:
+                fitted_gm = None
+
+            fitted_img = ultrahdr.UltraHDRImage(
+                sdr=fitted_sdr,
+                gain_map=fitted_gm,
+                params=img.params,
+                width=fitted_sdr.width,
+                height=fitted_sdr.height,
+            )
+
+            photo_pixels = process_gainmap_sdr_to_xrgb2101010(fitted_img)
+
+        elif not self._tv_hdr_active:
+            # SDR TV mode, no gain map: raw sRGB packed to 10-bit
             sdr = self.source.load_sdr(self.current_index)
             fitted = self._fit_image(sdr)
             photo_pixels = process_sdr_native_to_xrgb2101010(fitted)
@@ -205,6 +227,7 @@ class ViewerScreen:
             self._cached_index == self.current_index
             and self._cached_pixels is not None
             and self._cached_gain_map == self.gain_map_enabled
+            and self._cached_tv_hdr == self._tv_hdr_active
         )
         if cache_key_match:
             return  # Already rendered and SSBO still has the data
@@ -212,7 +235,9 @@ class ViewerScreen:
         photo = self.source[self.current_index]
         print(f"Rendering [GPU]: {photo.filename} ({self._render_mode_label()})")
 
-        if self.gain_map_enabled and photo.is_ultrahdr:
+        use_gainmap = self.gain_map_enabled and photo.is_ultrahdr
+
+        if use_gainmap:
             img = self.source.load_ultrahdr(self.current_index)
             fitted_sdr = self._fit_image(img.sdr)
             if img.gain_map is not None:
@@ -224,8 +249,12 @@ class ViewerScreen:
             x_offset = (self.display_width - pw) // 2
             y_offset = (self.display_height - ph) // 2
 
-            gpu.render_hdr(fitted_sdr, fitted_gm, img.params,
-                           pw, ph, x_offset, y_offset)
+            if self._tv_hdr_active:
+                gpu.render_hdr(fitted_sdr, fitted_gm, img.params,
+                               pw, ph, x_offset, y_offset)
+            else:
+                gpu.render_tonemap(fitted_sdr, fitted_gm, img.params,
+                                   pw, ph, x_offset, y_offset)
         else:
             sdr = self.source.load_sdr(self.current_index)
             fitted = self._fit_image(sdr)
@@ -234,11 +263,15 @@ class ViewerScreen:
             x_offset = (self.display_width - pw) // 2
             y_offset = (self.display_height - ph) // 2
 
-            gpu.render_sdr(fitted, pw, ph, x_offset, y_offset)
+            if self._tv_hdr_active:
+                gpu.render_sdr(fitted, pw, ph, x_offset, y_offset)
+            else:
+                gpu.render_native(fitted, pw, ph, x_offset, y_offset)
 
         self._cached_index = self.current_index
         self._cached_pixels = True  # Sentinel: SSBO has the data
         self._cached_gain_map = self.gain_map_enabled
+        self._cached_tv_hdr = self._tv_hdr_active
 
     def render_sdr(self) -> np.ndarray:
         """Render current photo as XRGB8888 SDR pixels (fallback)."""

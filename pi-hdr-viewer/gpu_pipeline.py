@@ -61,6 +61,9 @@ uniform float u_gm_max;
 uniform float u_offset_sdr;
 uniform float u_offset_hdr;
 
+// Output mode: 0 = HDR PQ, 1 = SDR native, 2 = SDR tone-mapped
+uniform int u_output_mode;
+
 // Display and image dimensions
 uniform int u_display_width;
 uniform int u_display_height;
@@ -83,6 +86,15 @@ highp vec3 srgb_eotf(highp vec3 x) {
         x / 12.92,
         pow((x + 0.055) / 1.055, vec3(2.4)),
         step(vec3(0.04045), x)
+    );
+}
+
+// sRGB optical-to-electrical transfer function (gamma encode)
+highp vec3 srgb_oetf(highp vec3 x) {
+    return mix(
+        x * 12.92,
+        1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055,
+        step(vec3(0.0031308), x)
     );
 }
 
@@ -115,8 +127,18 @@ void main() {
     // Texture coordinate (pixel center)
     vec2 uv = (vec2(img_pos) + 0.5) / vec2(float(u_image_width), float(u_image_height));
 
-    // Sample SDR image and decode sRGB
+    // Sample SDR image
     highp vec3 sdr = texture(u_sdr_tex, uv).rgb;
+
+    // SDR native: raw sRGB values packed to 10-bit, no transforms
+    if (u_output_mode == 1) {
+        uvec3 sdr8 = uvec3(clamp(sdr * 255.0 + 0.5, 0.0, 255.0));
+        uvec3 sdr10 = (sdr8 << 2u) | (sdr8 >> 6u);
+        pixels[idx] = (sdr10.r << 20u) | (sdr10.g << 10u) | sdr10.b;
+        return;
+    }
+
+    // Decode sRGB to linear
     highp vec3 linear_rgb = srgb_eotf(sdr);
 
     highp vec3 hdr_linear;
@@ -138,7 +160,17 @@ void main() {
         hdr_linear = linear_rgb;
     }
 
-    // sRGB → BT.2020 gamut conversion
+    // SDR tone-mapped: Reinhard → sRGB gamma → 8→10 bit native
+    if (u_output_mode == 2) {
+        highp vec3 mapped = hdr_linear / (vec3(1.0) + hdr_linear);
+        highp vec3 gamma = srgb_oetf(mapped);
+        uvec3 sdr8 = uvec3(clamp(gamma * 255.0 + 0.5, 0.0, 255.0));
+        uvec3 sdr10 = (sdr8 << 2u) | (sdr8 >> 6u);
+        pixels[idx] = (sdr10.r << 20u) | (sdr10.g << 10u) | sdr10.b;
+        return;
+    }
+
+    // HDR PQ: sRGB → BT.2020 gamut conversion → PQ encode
     highp vec3 bt2020 = u_color_matrix * hdr_linear;
     bt2020 = max(bt2020, vec3(0.0));
 
@@ -180,7 +212,7 @@ class GPUPipeline:
         # Cache uniform locations
         self._u = {}
         for name in ["u_has_gainmap", "u_gm_gamma", "u_gm_min", "u_gm_max",
-                      "u_offset_sdr", "u_offset_hdr",
+                      "u_offset_sdr", "u_offset_hdr", "u_output_mode",
                       "u_display_width", "u_display_height",
                       "u_image_x", "u_image_y", "u_image_width", "u_image_height",
                       "u_color_matrix"]:
@@ -248,8 +280,12 @@ class GPUPipeline:
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0,
                      GL_RED, GL_UNSIGNED_BYTE, data)
 
-    def _dispatch(self, has_gainmap, params, img_w, img_h, x_off, y_off):
-        """Set uniforms and dispatch the compute shader."""
+    def _dispatch(self, has_gainmap, params, img_w, img_h, x_off, y_off,
+                  output_mode=0):
+        """Set uniforms and dispatch the compute shader.
+
+        output_mode: 0 = HDR PQ, 1 = SDR native, 2 = SDR tone-mapped
+        """
         glUseProgram(self._program)
 
         # Image placement
@@ -257,6 +293,9 @@ class GPUPipeline:
         glUniform1i(self._u["u_image_y"], y_off)
         glUniform1i(self._u["u_image_width"], img_w)
         glUniform1i(self._u["u_image_height"], img_h)
+
+        # Output mode
+        glUniform1i(self._u["u_output_mode"], output_mode)
 
         # Gain map parameters
         glUniform1i(self._u["u_has_gainmap"], 1 if has_gainmap else 0)
@@ -299,8 +338,25 @@ class GPUPipeline:
         self._dispatch(False, None, img_w, img_h, x_off, y_off)
 
     def render_fullscreen(self, image):
-        """Render a fullscreen SDR canvas (grid/config screens)."""
+        """Render a fullscreen SDR canvas through PQ pipeline (grid/config in HDR)."""
         self.render_sdr(image, self.width, self.height, 0, 0)
+
+    def render_native(self, image, img_w, img_h, x_off, y_off):
+        """Render an SDR image as native sRGB (no color transform, 8→10 bit)."""
+        self._upload_sdr_texture(image)
+        self._dispatch(False, None, img_w, img_h, x_off, y_off, output_mode=1)
+
+    def render_native_fullscreen(self, image):
+        """Render a fullscreen SDR canvas as native sRGB (grid/config in SDR)."""
+        self.render_native(image, self.width, self.height, 0, 0)
+
+    def render_tonemap(self, sdr_image, gainmap_image, params, img_w, img_h, x_off, y_off):
+        """Render gain map + Reinhard tone-map to SDR native output."""
+        self._upload_sdr_texture(sdr_image)
+        if gainmap_image is not None:
+            self._upload_gainmap_texture(gainmap_image)
+        self._dispatch(gainmap_image is not None, params, img_w, img_h, x_off, y_off,
+                       output_mode=2)
 
     def get_pixels(self):
         """Get output as a new numpy uint32 array (copies from SSBO)."""

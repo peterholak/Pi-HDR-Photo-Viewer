@@ -249,6 +249,32 @@ def process_sdr_to_xrgb2101010(image: Image.Image) -> np.ndarray:
     return (pq10[:, :, 0] << 20) | (pq10[:, :, 1] << 10) | pq10[:, :, 2]
 
 
+def process_gainmap_sdr_to_xrgb2101010(img: UltraHDRImage) -> np.ndarray:
+    """Apply gain map then tone-map to SDR: gain map → Reinhard → sRGB → 10-bit native.
+
+    Shows recovered highlight detail from the gain map, compressed into SDR range.
+    Uses Reinhard tone-mapping: mapped = hdr / (1 + hdr) for soft highlight rolloff.
+    """
+    # Apply gain map → HDR linear (sRGB primaries)
+    hdr_linear = apply_gain_map(img)
+
+    # Reinhard tone-map: compress HDR range back to [0, 1]
+    mapped = hdr_linear / (1.0 + hdr_linear)
+
+    # Linear → sRGB gamma encode
+    srgb = np.where(mapped <= 0.0031308,
+                    mapped * 12.92,
+                    1.055 * np.power(np.maximum(mapped, 0.0), 1.0 / 2.4) - 0.055)
+    srgb = np.clip(srgb * 255.0 + 0.5, 0, 255).astype(np.uint32)
+
+    # 8→10 bit expansion
+    r10 = (srgb[:, :, 0] << 2) | (srgb[:, :, 0] >> 6)
+    g10 = (srgb[:, :, 1] << 2) | (srgb[:, :, 1] >> 6)
+    b10 = (srgb[:, :, 2] << 2) | (srgb[:, :, 2] >> 6)
+
+    return (r10 << 20) | (g10 << 10) | b10
+
+
 def process_sdr_native_to_xrgb2101010(image: Image.Image) -> np.ndarray:
     """Pack raw sRGB 8-bit values into 10-bit XRGB2101010 with NO color transform.
 
