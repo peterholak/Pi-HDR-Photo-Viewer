@@ -5,10 +5,12 @@ Kiosk-style app using DRM/KMS for direct HDMI output.
 Always-HDR mode: grid, viewer, and config all render to HDR10.
 
 Usage:
-    python main.py [--cpu] [photo_directory]
+    python main.py [--cpu] [--port=PORT] [--client-id=ID] [photo_directory]
 
 Options:
-    --cpu       Force CPU (numpy) rendering pipeline instead of GPU
+    --cpu           Force CPU (numpy) rendering pipeline instead of GPU
+    --port=PORT     WebSocket server port for companion app (default: 8765)
+    --client-id=ID  Azure AD client ID for OneDrive integration
 
 Controls:
     Arrow keys  -- navigate grid / prev/next photo
@@ -24,6 +26,7 @@ Controls:
 """
 
 import fcntl
+import logging
 import os
 import select
 import signal
@@ -41,6 +44,9 @@ from grid_screen import GridScreen
 from viewer_screen import ViewerScreen
 from config_screen import AppConfig, ConfigScreen
 from hdr_pipeline import process_sdr_to_xrgb2101010, process_sdr_native_to_xrgb2101010
+from server import CompanionServer
+from onedrive import OneDriveClient
+from onedrive_screen import OneDriveScreen
 
 
 # -- Linux input event constants --
@@ -56,6 +62,7 @@ KEY_H = 35
 KEY_D = 32
 KEY_G = 34
 KEY_M = 50
+KEY_O = 24
 KEY_C = 46
 KEY_ENTER = 28
 KEY_SPACE = 57
@@ -75,6 +82,7 @@ class AppState(Enum):
     GRID = auto()
     VIEWER = auto()
     CONFIG = auto()
+    ONEDRIVE_BROWSER = auto()
 
 
 def find_keyboard_devices():
@@ -119,6 +127,7 @@ CMD_TO_KEY = {
     "g": KEY_G, "gainmap": KEY_G,
     "h": KEY_H, "hdr": KEY_H,
     "m": KEY_M, "map": KEY_M,
+    "o": KEY_O, "onedrive": KEY_O,
 }
 
 
@@ -326,8 +335,17 @@ def render_toast(message: str, width: int, font: ImageFont.ImageFont,
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+
     # Parse arguments
     force_cpu = "--cpu" in sys.argv
+    server_port = 8765
+    client_id = None
+    for a in sys.argv[1:]:
+        if a.startswith("--port="):
+            server_port = int(a.split("=", 1)[1])
+        elif a.startswith("--client-id="):
+            client_id = a.split("=", 1)[1]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
     if args:
@@ -377,6 +395,21 @@ def main():
     viewer.debug_mode = config.debug_overlay
     config_screen = ConfigScreen(config, display.width, display.height)
 
+    # OneDrive client (optional, needs --client-id)
+    onedrive = None
+    onedrive_screen = None
+    if client_id:
+        onedrive = OneDriveClient(client_id)
+        onedrive_screen = OneDriveScreen(display.width, display.height,
+                                          cols=config.grid_columns)
+        print(f"OneDrive: client_id={client_id[:8]}... "
+              f"({'authenticated' if onedrive.is_authenticated else 'not signed in'})")
+
+    # Start companion WebSocket server
+    server = CompanionServer(port=server_port, onedrive=onedrive)
+    server.start()
+    last_viewport_seq = 0
+
     state = AppState.GRID
     needs_render = True
 
@@ -421,6 +454,26 @@ def main():
         viewer.slideshow_interval = config.slideshow_interval
         viewer.debug_mode = config.debug_overlay
 
+    def enter_onedrive():
+        nonlocal state, needs_render
+        if onedrive_screen is None:
+            show_toast("OneDrive not configured (--client-id)")
+            needs_render = True
+            return
+        state = AppState.ONEDRIVE_BROWSER
+        needs_render = True
+        if not onedrive.is_authenticated:
+            # Start device code auth
+            onedrive_screen.auth_prompt = None
+            server.request_device_code_auth()
+            onedrive_screen.loading = True
+            onedrive_screen.loading_message = "Starting sign-in..."
+        elif not onedrive_screen.items and not onedrive_screen.loading:
+            # Load root folder
+            onedrive_screen.loading = True
+            onedrive_screen.loading_message = "Loading OneDrive..."
+            server.request_folder_list("root")
+
     # Handle SIGTERM/SIGHUP for clean shutdown (e.g., pkill, SSH disconnect)
     def _signal_exit(signum, frame):
         raise SystemExit(0)
@@ -429,8 +482,175 @@ def main():
 
     enter_grid()
 
+    # Map server command actions to key codes
+    SERVER_ACTION_TO_KEY = {
+        "next": KEY_RIGHT, "prev": KEY_LEFT,
+        "slideshow_toggle": KEY_SPACE, "quit": KEY_Q,
+        "grid": KEY_ESC, "back": KEY_ESC,
+        "enter": KEY_ENTER, "onedrive": KEY_O,
+        "debug": KEY_D, "gainmap": KEY_G, "hdr": KEY_H,
+        "gainmap_view": KEY_M, "config": KEY_C,
+    }
+
+    def handle_server_commands():
+        """Drain server command queue, translate to key events or direct actions."""
+        nonlocal needs_render
+        events = []
+        while True:
+            cmd = server.get_command()
+            if cmd is None:
+                break
+            cmd_type = cmd.get("type")
+            if cmd_type == "command":
+                action = cmd.get("action", "")
+                if action == "select" and "index" in cmd:
+                    idx = int(cmd["index"])
+                    if state == AppState.GRID:
+                        enter_viewer(idx)
+                    elif state == AppState.VIEWER:
+                        viewer.set_photo(idx)
+                        needs_render = True
+                elif action in SERVER_ACTION_TO_KEY:
+                    events.append((SERVER_ACTION_TO_KEY[action], KEY_PRESS))
+            elif cmd_type == "get_state":
+                broadcast_viewer_state()
+            elif cmd_type == "get_thumbnails":
+                send_thumbnails(cmd.get("start", 0), cmd.get("count", 20))
+            elif cmd_type == "config":
+                key = cmd.get("key")
+                value = cmd.get("value")
+                if key == "slideshow_interval" and value is not None:
+                    config.slideshow_interval = float(value)
+                    viewer.slideshow_interval = config.slideshow_interval
+                elif key == "grid_columns" and value is not None:
+                    config.grid_columns = int(value)
+                    grid.set_columns(config.grid_columns)
+                    needs_render = True
+                config.save()
+            elif cmd_type == "onedrive_auth":
+                # Token injection from companion app
+                if onedrive:
+                    onedrive.set_tokens(
+                        cmd.get("access_token", ""),
+                        cmd.get("refresh_token", ""))
+                    show_toast("OneDrive: signed in via companion")
+                    needs_render = True
+            elif cmd_type == "onedrive_browse":
+                # Companion app requests folder browse
+                folder_id = cmd.get("folder_id", "root")
+                server.request_folder_list(folder_id)
+            elif cmd_type == "onedrive_select":
+                # Companion app requests photo download
+                item_id = cmd.get("item_id", "")
+                filename = cmd.get("filename", "photo.jpg")
+                server.request_download(item_id, filename)
+            elif cmd_type == "onedrive_folder_result":
+                # Async folder listing arrived
+                if onedrive_screen is not None:
+                    onedrive_screen.set_items(cmd["items"])
+                    needs_render = True
+                    # Request thumbnails for visible items
+                    needed = onedrive_screen.visible_item_ids()
+                    if needed:
+                        server.request_thumbnails_onedrive(needed)
+            elif cmd_type == "onedrive_thumbnail_ready":
+                if onedrive_screen is not None:
+                    onedrive_screen.set_thumbnail(cmd["item_id"], cmd["jpeg_bytes"])
+                    needs_render = True
+            elif cmd_type == "onedrive_device_code":
+                if onedrive_screen is not None:
+                    onedrive_screen.auth_prompt = {
+                        "user_code": cmd["user_code"],
+                        "verification_uri": cmd["verification_uri"],
+                    }
+                    onedrive_screen.loading = False
+                    needs_render = True
+            elif cmd_type == "onedrive_auth_complete":
+                if onedrive_screen is not None:
+                    onedrive_screen.auth_prompt = None
+                    show_toast(f"Signed in as {cmd.get('user', 'Unknown')}")
+                    # Auto-load root folder
+                    onedrive_screen.loading = True
+                    onedrive_screen.loading_message = "Loading OneDrive..."
+                    server.request_folder_list("root")
+                    needs_render = True
+            elif cmd_type == "onedrive_download_complete":
+                # Photo downloaded, add to source and view it
+                path = cmd.get("path")
+                filename = cmd.get("filename", "")
+                if path:
+                    source.add_photo(path, filename)
+                    enter_viewer(len(source) - 1)
+                    show_toast(f"Loaded: {filename}")
+            elif cmd_type == "onedrive_download_progress":
+                progress = cmd.get("progress", 0)
+                show_toast(f"Downloading... {int(progress * 100)}%")
+                needs_render = True
+            elif cmd_type == "onedrive_error":
+                show_toast(f"OneDrive: {cmd.get('message', 'Error')}")
+                if onedrive_screen is not None:
+                    onedrive_screen.loading = False
+                needs_render = True
+            elif cmd_type in ("companion_connected", "companion_disconnected"):
+                connected = cmd_type == "companion_connected"
+                show_toast(f"Companion {'connected' if connected else 'disconnected'}")
+                needs_render = True
+                if connected:
+                    broadcast_viewer_state()
+        return events
+
+    def broadcast_viewer_state():
+        """Send current state to companion app."""
+        current_photo = None
+        is_uhdr = False
+        if state in (AppState.VIEWER, AppState.GRID) and len(source) > 0:
+            idx = viewer.current_index if state == AppState.VIEWER else grid.selected
+            if 0 <= idx < len(source):
+                current_photo = source[idx].filename
+                is_uhdr = source[idx].is_ultrahdr
+        vp, _ = server.get_viewport()
+        server.broadcast_state({
+            "type": "state",
+            "app_state": state.name,
+            "current_index": viewer.current_index if state == AppState.VIEWER else grid.selected,
+            "total_photos": len(source),
+            "slideshow_active": viewer.slideshow_active,
+            "zoom": vp["zoom"],
+            "pan_cx": vp["cx"],
+            "pan_cy": vp["cy"],
+            "current_filename": current_photo,
+            "is_ultrahdr": is_uhdr,
+            "hdr_active": display._hdr_active,
+            "gain_map_enabled": viewer.gain_map_enabled,
+            "onedrive_authed": onedrive.is_authenticated if onedrive else False,
+            "onedrive_user": onedrive.user_display_name if onedrive else None,
+        })
+
+    def send_thumbnails(start, count):
+        """Generate and send JPEG thumbnails to companion app."""
+        import io
+        end = min(start + count, len(source))
+        for i in range(start, end):
+            photo = source[i]
+            try:
+                thumb = photo.get_thumbnail((300, 300))
+                buf = io.BytesIO()
+                thumb.save(buf, format="JPEG", quality=80)
+                jpeg_bytes = buf.getvalue()
+                server.send_binary(
+                    {"type": "thumbnail_header", "index": i,
+                     "filename": photo.filename,
+                     "is_ultrahdr": photo.is_ultrahdr,
+                     "size": len(jpeg_bytes)},
+                    jpeg_bytes)
+            except Exception as e:
+                print(f"  thumbnail error [{i}]: {e}")
+
     print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
     print("  C: config   D: debug   G: gain map   H: HDR/SDR   M: show gain map")
+    if onedrive:
+        print("  O: OneDrive browser")
+    print(f"  Companion server: ws://0.0.0.0:{server_port}")
 
     try:
         while True:
@@ -443,6 +663,18 @@ def main():
                 needs_render = True  # Re-render to clear toast
 
             key_events = input_handler.poll(timeout=0.05)
+
+            # Drain server command queue
+            server_events = handle_server_commands()
+            key_events.extend(server_events)
+
+            # Check for viewport updates from companion app
+            if state == AppState.VIEWER:
+                vp, vp_seq = server.get_viewport()
+                if vp_seq != last_viewport_seq:
+                    last_viewport_seq = vp_seq
+                    viewer.set_viewport(vp["cx"], vp["cy"], vp["zoom"])
+                    needs_render = True
 
             for key_code, key_state in key_events:
                 if state == AppState.GRID:
@@ -462,6 +694,8 @@ def main():
                         enter_viewer(grid.selected)
                     elif key_code == KEY_C:
                         enter_config()
+                    elif key_code == KEY_O:
+                        enter_onedrive()
                     elif key_code == KEY_H:
                         new_hdr = not display._hdr_active
                         display.set_hdr_enabled(new_hdr)
@@ -528,6 +762,47 @@ def main():
                     elif key_code == KEY_Q:
                         raise KeyboardInterrupt
 
+                elif state == AppState.ONEDRIVE_BROWSER and onedrive_screen is not None:
+                    if key_code in (KEY_ESC, KEY_EXIT):
+                        # Navigate up or back to grid
+                        parent = onedrive_screen.navigate_back()
+                        if parent is not None:
+                            server.request_folder_list(parent)
+                            needs_render = True
+                        else:
+                            enter_grid()
+                    elif key_code == KEY_LEFT:
+                        onedrive_screen.move_selection(-1, 0)
+                        needs_render = True
+                    elif key_code == KEY_RIGHT:
+                        onedrive_screen.move_selection(1, 0)
+                        needs_render = True
+                    elif key_code == KEY_UP:
+                        onedrive_screen.move_selection(0, -1)
+                        needs_render = True
+                    elif key_code == KEY_DOWN:
+                        onedrive_screen.move_selection(0, 1)
+                        needs_render = True
+                    elif key_code in (KEY_ENTER, KEY_OK):
+                        item = onedrive_screen.get_selected_item()
+                        if item and item.is_folder:
+                            onedrive_screen.navigate_into(item.id, item.name)
+                            server.request_folder_list(item.id)
+                            needs_render = True
+                        elif item and item.is_photo:
+                            show_toast(f"Downloading {item.name}...")
+                            server.request_download(item.id, item.name)
+                            needs_render = True
+                    elif key_code == KEY_Q:
+                        raise KeyboardInterrupt
+
+            # Request OneDrive thumbnails for visible items after any changes
+            if (state == AppState.ONEDRIVE_BROWSER and onedrive_screen is not None
+                    and needs_render):
+                needed = onedrive_screen.visible_item_ids()
+                if needed:
+                    server.request_thumbnails_onedrive(needed)
+
             if needs_render:
                 t0 = time.monotonic()
                 hdr_active = display._hdr_active
@@ -544,6 +819,12 @@ def main():
                             gpu.render_native_fullscreen(canvas)
                     elif state == AppState.CONFIG:
                         canvas = config_screen._render_canvas()
+                        if hdr_active:
+                            gpu.render_fullscreen(canvas)
+                        else:
+                            gpu.render_native_fullscreen(canvas)
+                    elif state == AppState.ONEDRIVE_BROWSER and onedrive_screen is not None:
+                        canvas = onedrive_screen._render_canvas()
                         if hdr_active:
                             gpu.render_fullscreen(canvas)
                         else:
@@ -575,6 +856,8 @@ def main():
                         pixels = viewer.render_hdr()
                     elif state == AppState.CONFIG:
                         pixels = config_screen.render_hdr() if hdr_active else config_screen.render_native()
+                    elif state == AppState.ONEDRIVE_BROWSER and onedrive_screen is not None:
+                        pixels = onedrive_screen.render_hdr() if hdr_active else onedrive_screen.render_native()
                     t1 = time.monotonic()
 
                     mm = fb.mmap_buffer()
@@ -604,6 +887,7 @@ def main():
                 print(f"  render: {t1-t0:.2f}s, write: {t2-t1:.2f}s")
 
                 needs_render = False
+                broadcast_viewer_state()
 
     except (KeyboardInterrupt, SystemExit):
         print("\nExiting...")

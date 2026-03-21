@@ -86,6 +86,20 @@ class PhotoSource:
         photo = self.photos[index]
         return Image.open(photo.path).convert("RGB")
 
+    def add_photo(self, path: str, filename: str):
+        """Add a photo dynamically (e.g., from OneDrive download)."""
+        index = len(self.photos)
+        info = PhotoInfo(path=path, filename=filename, index=index)
+        try:
+            with open(path, "rb") as f:
+                header = f.read(65536)
+            if b"hdrgm" in header or b"hdr-gainmap" in header or b"MPF\0" in header:
+                info.is_ultrahdr = True
+        except OSError:
+            pass
+        self.photos.append(info)
+        return index
+
     def rescan(self):
         """Re-scan the directory for changes."""
         self._scan()

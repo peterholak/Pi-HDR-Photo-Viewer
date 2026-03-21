@@ -35,6 +35,10 @@ class ViewerScreen:
         self.gain_map_enabled = True
         self.show_gainmap_view = False
         self._tv_hdr_active = True
+        self.zoom_level = 1.0
+        self.pan_cx = 0.5
+        self.pan_cy = 0.5
+        self._cached_viewport = (1.0, 0.5, 0.5)
 
         self._font = None
         try:
@@ -45,12 +49,25 @@ class ViewerScreen:
             except (OSError, IOError):
                 self._font = ImageFont.load_default()
 
+    def set_viewport(self, cx: float, cy: float, zoom: float):
+        """Set the zoom/pan viewport (normalized coordinates)."""
+        self.zoom_level = max(1.0, min(10.0, zoom))
+        self.pan_cx = max(0.0, min(1.0, cx))
+        self.pan_cy = max(0.0, min(1.0, cy))
+
+    def get_viewport(self) -> dict:
+        return {"cx": self.pan_cx, "cy": self.pan_cy, "zoom": self.zoom_level}
+
     def set_photo(self, index: int):
         """Set the current photo index."""
         if 0 <= index < len(self.source):
             self.current_index = index
             self._cached_index = -1
             self._last_advance_time = time.monotonic()
+            # Reset viewport on photo change
+            self.zoom_level = 1.0
+            self.pan_cx = 0.5
+            self.pan_cy = 0.5
 
     def next_photo(self):
         """Advance to next photo."""
@@ -106,6 +123,25 @@ class ViewerScreen:
             self.next_photo()
             return True
         return False
+
+    def _crop_viewport(self, img: Image.Image) -> Image.Image:
+        """Crop image to the visible viewport region when zoomed."""
+        if self.zoom_level <= 1.0:
+            return img
+        w, h = img.size
+        frac = 1.0 / self.zoom_level
+        # Source rectangle in pixel coords, clamped to image bounds
+        half_w = frac * w / 2
+        half_h = frac * h / 2
+        cx = self.pan_cx * w
+        cy = self.pan_cy * h
+        x0 = max(0, int(cx - half_w))
+        y0 = max(0, int(cy - half_h))
+        x1 = min(w, int(cx + half_w))
+        y1 = min(h, int(cy + half_h))
+        if x1 <= x0 or y1 <= y0:
+            return img
+        return img.crop((x0, y0, x1, y1))
 
     def _fit_image(self, img: Image.Image) -> Image.Image:
         """Scale image to fit display while maintaining aspect ratio."""
@@ -164,12 +200,14 @@ class ViewerScreen:
 
     def render_hdr(self) -> np.ndarray:
         """Render current photo as XRGB2101010 pixels."""
+        viewport_key = (self.zoom_level, self.pan_cx, self.pan_cy)
         cache_key_match = (
             self._cached_index == self.current_index
             and self._cached_pixels is not None
             and self._cached_gain_map == self.gain_map_enabled
             and self._cached_tv_hdr == self._tv_hdr_active
             and self._cached_gm_view == self.show_gainmap_view
+            and self._cached_viewport == viewport_key
         )
         if cache_key_match:
             return self._cached_pixels
@@ -182,6 +220,7 @@ class ViewerScreen:
         if self.show_gainmap_view and photo.is_ultrahdr:
             gm_rgb = self._render_gainmap_grayscale(photo)
             if gm_rgb is not None:
+                gm_rgb = self._crop_viewport(gm_rgb)
                 if self._tv_hdr_active:
                     photo_pixels = process_sdr_to_xrgb2101010(gm_rgb)
                 else:
@@ -190,12 +229,14 @@ class ViewerScreen:
                 photo_pixels = np.zeros((1, 1), dtype=np.uint32)
 
         elif not self._tv_hdr_active and self.gain_map_enabled and photo.is_ultrahdr:
-            # SDR TV + gain map: tone-mapped gain map → sRGB → native 10-bit
+            # SDR TV + gain map: tone-mapped gain map -> sRGB -> native 10-bit
             img = self.source.load_ultrahdr(self.current_index)
+            cropped_sdr = self._crop_viewport(img.sdr)
 
-            fitted_sdr = self._fit_image(img.sdr)
+            fitted_sdr = self._fit_image(cropped_sdr)
             if img.gain_map is not None:
-                fitted_gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+                cropped_gm = self._crop_viewport(img.gain_map)
+                fitted_gm = cropped_gm.resize(fitted_sdr.size, Image.BILINEAR)
             else:
                 fitted_gm = None
 
@@ -212,16 +253,19 @@ class ViewerScreen:
         elif not self._tv_hdr_active:
             # SDR TV mode, no gain map: raw sRGB packed to 10-bit
             sdr = self.source.load_sdr(self.current_index)
-            fitted = self._fit_image(sdr)
+            cropped = self._crop_viewport(sdr)
+            fitted = self._fit_image(cropped)
             photo_pixels = process_sdr_native_to_xrgb2101010(fitted)
 
         elif self.gain_map_enabled and photo.is_ultrahdr:
             # HDR TV + gain map: full HDR pipeline
             img = self.source.load_ultrahdr(self.current_index)
+            cropped_sdr = self._crop_viewport(img.sdr)
 
-            fitted_sdr = self._fit_image(img.sdr)
+            fitted_sdr = self._fit_image(cropped_sdr)
             if img.gain_map is not None:
-                fitted_gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+                cropped_gm = self._crop_viewport(img.gain_map)
+                fitted_gm = cropped_gm.resize(fitted_sdr.size, Image.BILINEAR)
             else:
                 fitted_gm = None
 
@@ -238,7 +282,8 @@ class ViewerScreen:
         else:
             # HDR TV + no gain map (or non-Ultra-HDR photo): sRGB->linear->BT.2020->PQ
             sdr = self.source.load_sdr(self.current_index)
-            fitted = self._fit_image(sdr)
+            cropped = self._crop_viewport(sdr)
+            fitted = self._fit_image(cropped)
             photo_pixels = process_sdr_to_xrgb2101010(fitted)
 
         # Center in output (letterbox/pillarbox)
@@ -255,6 +300,7 @@ class ViewerScreen:
         self._cached_gain_map = self.gain_map_enabled
         self._cached_tv_hdr = self._tv_hdr_active
         self._cached_gm_view = self.show_gainmap_view
+        self._cached_viewport = viewport_key
         return output
 
     def render_to_gpu(self, gpu):
@@ -263,12 +309,14 @@ class ViewerScreen:
         Uploads raw PIL images to GPU and dispatches compute shader.
         The output is in the GPU pipeline's SSBO, ready for copy_to_framebuffer().
         """
+        viewport_key = (self.zoom_level, self.pan_cx, self.pan_cy)
         cache_key_match = (
             self._cached_index == self.current_index
             and self._cached_pixels is not None
             and self._cached_gain_map == self.gain_map_enabled
             and self._cached_tv_hdr == self._tv_hdr_active
             and self._cached_gm_view == self.show_gainmap_view
+            and self._cached_viewport == viewport_key
         )
         if cache_key_match:
             return  # Already rendered and SSBO still has the data
@@ -279,6 +327,7 @@ class ViewerScreen:
         if self.show_gainmap_view and photo.is_ultrahdr:
             gm_rgb = self._render_gainmap_grayscale(photo)
             if gm_rgb is not None:
+                gm_rgb = self._crop_viewport(gm_rgb)
                 pw, ph = gm_rgb.size
                 x_offset = (self.display_width - pw) // 2
                 y_offset = (self.display_height - ph) // 2
@@ -292,15 +341,18 @@ class ViewerScreen:
             self._cached_gain_map = self.gain_map_enabled
             self._cached_tv_hdr = self._tv_hdr_active
             self._cached_gm_view = self.show_gainmap_view
+            self._cached_viewport = viewport_key
             return
 
         use_gainmap = self.gain_map_enabled and photo.is_ultrahdr
 
         if use_gainmap:
             img = self.source.load_ultrahdr(self.current_index)
-            fitted_sdr = self._fit_image(img.sdr)
+            cropped_sdr = self._crop_viewport(img.sdr)
+            fitted_sdr = self._fit_image(cropped_sdr)
             if img.gain_map is not None:
-                fitted_gm = img.gain_map.resize(fitted_sdr.size, Image.BILINEAR)
+                cropped_gm = self._crop_viewport(img.gain_map)
+                fitted_gm = cropped_gm.resize(fitted_sdr.size, Image.BILINEAR)
             else:
                 fitted_gm = None
 
@@ -316,7 +368,8 @@ class ViewerScreen:
                                    pw, ph, x_offset, y_offset)
         else:
             sdr = self.source.load_sdr(self.current_index)
-            fitted = self._fit_image(sdr)
+            cropped = self._crop_viewport(sdr)
+            fitted = self._fit_image(cropped)
 
             pw, ph = fitted.size
             x_offset = (self.display_width - pw) // 2
@@ -332,6 +385,7 @@ class ViewerScreen:
         self._cached_gain_map = self.gain_map_enabled
         self._cached_tv_hdr = self._tv_hdr_active
         self._cached_gm_view = self.show_gainmap_view
+        self._cached_viewport = viewport_key
 
     def render_sdr(self) -> np.ndarray:
         """Render current photo as XRGB8888 SDR pixels (fallback)."""

@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 demo-pics/
 
+# Flutter
+pihdr_companion_app/.dart_tool/
+pihdr_companion_app/build/
+pihdr_companion_app/.flutter-plugins
+pihdr_companion_app/.flutter-plugins-dependencies
+
