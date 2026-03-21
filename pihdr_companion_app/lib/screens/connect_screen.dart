@@ -54,12 +54,14 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     await _storage.write(key: _storageKeyPort, value: port.toString());
 
     final ws = ref.read(wsServiceProvider);
+    debugPrint('Connecting to $host:$port...');
     await ws.connect(host, port: port);
 
     // Wait briefly for connection
     bool connected = false;
     for (int i = 0; i < 20; i++) {
       await Future.delayed(const Duration(milliseconds: 150));
+      debugPrint('  poll $i: ${ws.connectionState}');
       if (ws.connectionState == WsConnectionState.connected) {
         connected = true;
         break;

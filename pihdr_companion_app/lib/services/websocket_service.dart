@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as dev;
 import 'dart:typed_data';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -39,17 +40,21 @@ class WebSocketService {
 
     try {
       final uri = Uri.parse('ws://$_host:$_port');
+      dev.log('WS: connecting to $uri', name: 'WebSocket');
       _channel = WebSocketChannel.connect(uri);
       await _channel!.ready;
+      dev.log('WS: connected', name: 'WebSocket');
       _setWsConnectionState(WsConnectionState.connected);
 
       _channel!.stream.listen(
         _onMessage,
         onError: (error) {
+          dev.log('WS: stream error: $error', name: 'WebSocket');
           _setWsConnectionState(WsConnectionState.error);
           _scheduleReconnect();
         },
         onDone: () {
+          dev.log('WS: stream done (disconnected)', name: 'WebSocket');
           _setWsConnectionState(WsConnectionState.disconnected);
           _scheduleReconnect();
         },
@@ -58,6 +63,7 @@ class WebSocketService {
       // Request initial state
       sendJson({'type': 'get_state'});
     } catch (e) {
+      dev.log('WS: connect failed: $e', name: 'WebSocket');
       _setWsConnectionState(WsConnectionState.error);
       _scheduleReconnect();
     }
