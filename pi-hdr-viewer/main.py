@@ -442,9 +442,11 @@ def main():
 
         print("Activating display...")
         input_handler.grab()
-        if display is None:
-            display = DRMDisplay()
-            display.open()
+        if display is not None:
+            # Close the fd held open for HDMI-off, reopen fresh
+            display.close()
+        display = DRMDisplay()
+        display.open()
 
         # GPU pipeline
         if not force_cpu:
@@ -515,13 +517,13 @@ def main():
             fb.close()
             fb = None
 
-        if disable_hdmi and display is not None:
-            # Keep DRM fd open but disable HDMI output (TV shows 'No Signal')
-            display.disable_output()
-        else:
-            if display is not None:
+        if display is not None:
+            if disable_hdmi:
+                # Disable output but keep fd open to hold ACTIVE=0 state
+                display.disable_output()
+            else:
                 display.close()
-            display = None
+                display = None
 
         grid = None
         viewer = None
@@ -762,7 +764,14 @@ def main():
         if onedrive:
             print("  O: OneDrive browser")
     else:
-        print("\nStandby mode. Waiting for companion app to connect...")
+        if disable_hdmi:
+            # Open display to disable HDMI output (fd stays open to hold ACTIVE=0)
+            display = DRMDisplay()
+            display.open()
+            display.disable_output()
+            print("\nStandby mode (HDMI disabled). Waiting for companion app to connect...")
+        else:
+            print("\nStandby mode. Waiting for companion app to connect...")
 
     print(f"  Companion server: ws://0.0.0.0:{server_port}")
 
@@ -822,7 +831,7 @@ def main():
                         viewer.set_tv_mode(new_hdr)
                         needs_render = True
                         show_toast(f"TV: {'HDR10' if new_hdr else 'SDR'}")
-                    elif key_code in (KEY_ESC, KEY_EXIT, KEY_Q):
+                    elif key_code == KEY_Q:
                         raise KeyboardInterrupt
 
                 elif state == AppState.VIEWER:
@@ -1014,7 +1023,6 @@ def main():
 
     finally:
         deactivate_display()
-        # Close DRM fd if still open (disable-hdmi keeps it open in standby)
         if display is not None:
             display.close()
             display = None
