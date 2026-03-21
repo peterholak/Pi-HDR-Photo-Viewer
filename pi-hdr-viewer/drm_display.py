@@ -955,16 +955,22 @@ class DRMDisplay:
         print(f"HDR {'enabled' if enabled else 'disabled'} (runtime toggle)")
 
     def disable_output(self):
-        """Disable HDMI output via DPMS (TV shows 'No Signal').
+        """Disable HDMI output (TV shows 'No Signal').
 
+        Uses CRTC ACTIVE=0 on atomic drivers, DPMS OFF on legacy.
         Keeps the DRM fd open so we can re-enable later with set_mode().
         """
         if self.fd < 0:
             return
         try:
-            self.set_connector_property("DPMS", 3)  # DRM_MODE_DPMS_OFF
+            if self._atomic:
+                active_prop = self._get_prop_id(self.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE")
+                if active_prop:
+                    self._atomic_commit({self.crtc_id: [(active_prop, 0)]})
+            else:
+                self.set_connector_property("DPMS", 3)  # DRM_MODE_DPMS_OFF
         except OSError as e:
-            print(f"Warning: DPMS off failed: {e}")
+            print(f"Warning: disable output failed: {e}")
 
         # Disable HDR while output is off
         try:

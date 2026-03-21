@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/home/haro/photo-hdr/.venv/bin/python -u /home/haro/photo-hdr/pi-hdr-viewer/main.py
+ExecStart=/home/haro/photo-hdr/.venv/bin/python -u /home/haro/photo-hdr/pi-hdr-viewer/main.py --disable-hdmi
 Restart=on-failure
 RestartSec=5
 Environment=XDG_RUNTIME_DIR=/run/user/1000
