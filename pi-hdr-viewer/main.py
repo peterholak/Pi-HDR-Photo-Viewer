@@ -470,11 +470,22 @@ def main():
             onedrive_screen = OneDriveScreen(display.width, display.height,
                                               cols=config.grid_columns)
 
-        # Framebuffer and HDR
-        fb = display.create_framebuffer(DRM_FORMAT_XRGB2101010)
+        # Framebuffer — try 10-bit, fall back to 8-bit
+        try:
+            fb = display.create_framebuffer(DRM_FORMAT_XRGB2101010)
+        except OSError:
+            print("10-bit framebuffer not supported, falling back to 8-bit")
+            fb = display.create_framebuffer()  # default XRGB8888
         fb.mmap_buffer()
-        display.enable_hdr()
-        display.set_mode(fb, hdr_blob_id=display._hdr_blob_id)
+
+        # HDR metadata (may not be supported on all drivers)
+        try:
+            display.enable_hdr()
+            display.set_mode(fb, hdr_blob_id=display._hdr_blob_id)
+        except (OSError, AttributeError):
+            print("HDR metadata not supported, using SDR output")
+            display._hdr_active = False
+            display.set_mode(fb)
 
         toast_font = _find_toast_font()
         state = AppState.GRID
