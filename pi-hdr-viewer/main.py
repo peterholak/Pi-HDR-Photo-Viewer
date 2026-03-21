@@ -4,11 +4,15 @@
 Kiosk-style app using DRM/KMS for direct HDMI output.
 Always-HDR mode: grid, viewer, and config all render to HDR10.
 
+Starts in standby mode (WebSocket server only, no TV output).
+TV activates when a companion app connects, deactivates on disconnect.
+
 Usage:
-    python main.py [--cpu] [--port=PORT] [--client-id=ID] [photo_directory]
+    python main.py [--cpu] [--no-standby] [--port=PORT] [--client-id=ID] [photo_directory]
 
 Options:
     --cpu           Force CPU (numpy) rendering pipeline instead of GPU
+    --no-standby    Start with display active immediately (no companion app needed)
     --port=PORT     WebSocket server port for companion app (default: 8765)
     --client-id=ID  Azure AD client ID for OneDrive integration
 
@@ -79,6 +83,7 @@ KEY_REPEAT = 2
 
 
 class AppState(Enum):
+    STANDBY = auto()
     GRID = auto()
     VIEWER = auto()
     CONFIG = auto()
@@ -160,9 +165,10 @@ EVIOCGRAB = 0x40044590
 class InputHandler:
     """Reads keyboard events from /dev/input/event* and a command pipe."""
 
-    def __init__(self, cmd_pipe_path=None):
+    def __init__(self, cmd_pipe_path=None, grab=False):
         self.fds = []
         self.files = []
+        self._input_files = []  # keyboard device files (subset of self.files)
         self._grabbed = []  # file objects with exclusive grab
         self._pipe_file = None
 
@@ -174,12 +180,7 @@ class InputHandler:
                 f = open(path, "rb", buffering=0)
                 self.fds.append(f.fileno())
                 self.files.append(f)
-                # Grab exclusive access so keys don't leak to the console
-                try:
-                    fcntl.ioctl(f.fileno(), EVIOCGRAB, 1)
-                    self._grabbed.append(f)
-                except OSError:
-                    pass
+                self._input_files.append(f)
                 print(f"Opened input device: {path}")
             except PermissionError:
                 print(f"Warning: no permission for {path} (run as root or add to 'input' group)")
@@ -263,6 +264,25 @@ class InputHandler:
             self.files.pop(idx)
             self._pipe_file = None
 
+    def grab(self):
+        """Grab exclusive access to input devices (prevents console key leakage)."""
+        for f in self._input_files:
+            if f not in self._grabbed:
+                try:
+                    fcntl.ioctl(f.fileno(), EVIOCGRAB, 1)
+                    self._grabbed.append(f)
+                except OSError:
+                    pass
+
+    def ungrab(self):
+        """Release exclusive access to input devices."""
+        for f in self._grabbed:
+            try:
+                fcntl.ioctl(f.fileno(), EVIOCGRAB, 0)
+            except OSError:
+                pass
+        self._grabbed.clear()
+
     def close(self):
         for f in self._grabbed:
             try:
@@ -339,6 +359,7 @@ def main():
 
     # Parse arguments
     force_cpu = "--cpu" in sys.argv
+    no_standby = "--no-standby" in sys.argv
     server_port = 8765
     client_id = None
     for a in sys.argv[1:]:
@@ -364,44 +385,18 @@ def main():
 
     source = PhotoSource(photo_dir)
     if len(source) == 0:
-        print("No photos found. Exiting.")
-        sys.exit(1)
-
-    display = DRMDisplay()
-    display.open()
-
-    # Initialize GPU pipeline (unless --cpu)
-    gpu_ctx = None
-    gpu = None
-    if not force_cpu:
-        try:
-            from gpu_context import GPUContext
-            from gpu_pipeline import GPUPipeline
-            gpu_ctx = GPUContext(display.fd)
-            gpu = GPUPipeline(gpu_ctx, display.width, display.height)
-            print("GPU: pipeline ready")
-        except Exception as e:
-            print(f"GPU: init failed ({e}), using CPU path")
-            gpu_ctx = None
-            gpu = None
-    else:
-        print("GPU: disabled (--cpu flag)")
+        if no_standby:
+            print("No photos found. Exiting.")
+            sys.exit(1)
+        else:
+            print("No photos found (will wait for OneDrive or companion app).")
 
     input_handler = InputHandler()
 
-    grid = GridScreen(source, display.width, display.height, cols=config.grid_columns)
-    viewer = ViewerScreen(source, display.width, display.height)
-    viewer.slideshow_interval = config.slideshow_interval
-    viewer.debug_mode = config.debug_overlay
-    config_screen = ConfigScreen(config, display.width, display.height)
-
     # OneDrive client (optional, needs --client-id)
     onedrive = None
-    onedrive_screen = None
     if client_id:
         onedrive = OneDriveClient(client_id)
-        onedrive_screen = OneDriveScreen(display.width, display.height,
-                                          cols=config.grid_columns)
         print(f"OneDrive: client_id={client_id[:8]}... "
               f"({'authenticated' if onedrive.is_authenticated else 'not signed in'})")
 
@@ -410,24 +405,113 @@ def main():
     server.start()
     last_viewport_seq = 0
 
-    state = AppState.GRID
-    needs_render = True
+    # -- Display state (None when in standby) --
+    display = None
+    gpu_ctx = None
+    gpu = None
+    grid = None
+    viewer = None
+    config_screen = None
+    onedrive_screen = None
+    fb = None
+    toast_font = None
 
-    fb = display.create_framebuffer(DRM_FORMAT_XRGB2101010)
-    fb.mmap_buffer()
-
-    display.enable_hdr()
-    display.set_mode(fb, hdr_blob_id=display._hdr_blob_id)
+    state = AppState.STANDBY
+    needs_render = False
 
     # Toast state
     toast_message = ""
     toast_time = 0.0
-    toast_font = _find_toast_font()
 
     def show_toast(msg: str):
-        nonlocal toast_message, toast_time
+        nonlocal toast_message, toast_time, needs_render
         toast_message = msg
         toast_time = time.monotonic()
+        if display is not None:
+            needs_render = True
+
+    def activate_display():
+        """Initialize DRM display, GPU, screens, and framebuffer."""
+        nonlocal display, gpu_ctx, gpu, grid, viewer, config_screen
+        nonlocal onedrive_screen, fb, toast_font, state, needs_render
+
+        if display is not None:
+            return  # Already active
+
+        print("Activating display...")
+        input_handler.grab()
+        display = DRMDisplay()
+        display.open()
+
+        # GPU pipeline
+        if not force_cpu:
+            try:
+                from gpu_context import GPUContext
+                from gpu_pipeline import GPUPipeline
+                gpu_ctx = GPUContext(display.fd)
+                gpu = GPUPipeline(gpu_ctx, display.width, display.height)
+                print("GPU: pipeline ready")
+            except Exception as e:
+                print(f"GPU: init failed ({e}), using CPU path")
+                gpu_ctx = None
+                gpu = None
+        else:
+            print("GPU: disabled (--cpu flag)")
+
+        # Screen objects
+        grid = GridScreen(source, display.width, display.height,
+                         cols=config.grid_columns)
+        viewer = ViewerScreen(source, display.width, display.height)
+        viewer.slideshow_interval = config.slideshow_interval
+        viewer.debug_mode = config.debug_overlay
+        config_screen = ConfigScreen(config, display.width, display.height)
+
+        if client_id:
+            onedrive_screen = OneDriveScreen(display.width, display.height,
+                                              cols=config.grid_columns)
+
+        # Framebuffer and HDR
+        fb = display.create_framebuffer(DRM_FORMAT_XRGB2101010)
+        fb.mmap_buffer()
+        display.enable_hdr()
+        display.set_mode(fb, hdr_blob_id=display._hdr_blob_id)
+
+        toast_font = _find_toast_font()
+        state = AppState.GRID
+        needs_render = True
+        print("Display active.")
+
+    def deactivate_display():
+        """Tear down display and all display-dependent objects."""
+        nonlocal display, gpu_ctx, gpu, grid, viewer, config_screen
+        nonlocal onedrive_screen, fb, toast_font, state, needs_render
+
+        if display is None:
+            return  # Already in standby
+
+        print("Deactivating display...")
+        input_handler.ungrab()
+        if gpu:
+            gpu.close()
+            gpu = None
+        if gpu_ctx:
+            gpu_ctx.close()
+            gpu_ctx = None
+        if fb:
+            fb.close()
+            fb = None
+        display.close()
+        display = None
+
+        grid = None
+        viewer = None
+        config_screen = None
+        onedrive_screen = None
+        toast_font = None
+
+        state = AppState.STANDBY
+        needs_render = False
+        print("Display deactivated, standby mode.")
 
     def enter_grid():
         nonlocal state, needs_render
@@ -458,7 +542,6 @@ def main():
         nonlocal state, needs_render
         if onedrive_screen is None:
             show_toast("OneDrive not configured (--client-id)")
-            needs_render = True
             return
         state = AppState.ONEDRIVE_BROWSER
         needs_render = True
@@ -480,8 +563,6 @@ def main():
     signal.signal(signal.SIGTERM, _signal_exit)
     signal.signal(signal.SIGHUP, _signal_exit)
 
-    enter_grid()
-
     # Map server command actions to key codes
     SERVER_ACTION_TO_KEY = {
         "next": KEY_RIGHT, "prev": KEY_LEFT,
@@ -502,6 +583,12 @@ def main():
                 break
             cmd_type = cmd.get("type")
             if cmd_type == "command":
+                if state == AppState.STANDBY:
+                    # In standby, only quit is accepted
+                    action = cmd.get("action", "")
+                    if action in ("quit", "q"):
+                        events.append((KEY_Q, KEY_PRESS))
+                    continue
                 action = cmd.get("action", "")
                 if action == "select" and "index" in cmd:
                     idx = int(cmd["index"])
@@ -517,16 +604,18 @@ def main():
             elif cmd_type == "get_thumbnails":
                 send_thumbnails(cmd.get("start", 0), cmd.get("count", 20))
             elif cmd_type == "config":
-                key = cmd.get("key")
-                value = cmd.get("value")
-                if key == "slideshow_interval" and value is not None:
-                    config.slideshow_interval = float(value)
-                    viewer.slideshow_interval = config.slideshow_interval
-                elif key == "grid_columns" and value is not None:
-                    config.grid_columns = int(value)
-                    grid.set_columns(config.grid_columns)
-                    needs_render = True
-                config.save()
+                if viewer is not None:
+                    key = cmd.get("key")
+                    value = cmd.get("value")
+                    if key == "slideshow_interval" and value is not None:
+                        config.slideshow_interval = float(value)
+                        viewer.slideshow_interval = config.slideshow_interval
+                    elif key == "grid_columns" and value is not None:
+                        config.grid_columns = int(value)
+                        if grid:
+                            grid.set_columns(config.grid_columns)
+                        needs_render = True
+                    config.save()
             elif cmd_type == "onedrive_auth":
                 # Token injection from companion app
                 if onedrive:
@@ -534,22 +623,17 @@ def main():
                         cmd.get("access_token", ""),
                         cmd.get("refresh_token", ""))
                     show_toast("OneDrive: signed in via companion")
-                    needs_render = True
             elif cmd_type == "onedrive_browse":
-                # Companion app requests folder browse
                 folder_id = cmd.get("folder_id", "root")
                 server.request_folder_list(folder_id)
             elif cmd_type == "onedrive_select":
-                # Companion app requests photo download
                 item_id = cmd.get("item_id", "")
                 filename = cmd.get("filename", "photo.jpg")
                 server.request_download(item_id, filename)
             elif cmd_type == "onedrive_folder_result":
-                # Async folder listing arrived
                 if onedrive_screen is not None:
                     onedrive_screen.set_items(cmd["items"])
                     needs_render = True
-                    # Request thumbnails for visible items
                     needed = onedrive_screen.visible_item_ids()
                     if needed:
                         server.request_thumbnails_onedrive(needed)
@@ -569,34 +653,34 @@ def main():
                 if onedrive_screen is not None:
                     onedrive_screen.auth_prompt = None
                     show_toast(f"Signed in as {cmd.get('user', 'Unknown')}")
-                    # Auto-load root folder
                     onedrive_screen.loading = True
                     onedrive_screen.loading_message = "Loading OneDrive..."
                     server.request_folder_list("root")
                     needs_render = True
             elif cmd_type == "onedrive_download_complete":
-                # Photo downloaded, add to source and view it
                 path = cmd.get("path")
                 filename = cmd.get("filename", "")
                 if path:
                     source.add_photo(path, filename)
-                    enter_viewer(len(source) - 1)
+                    if display is not None:
+                        enter_viewer(len(source) - 1)
                     show_toast(f"Loaded: {filename}")
             elif cmd_type == "onedrive_download_progress":
                 progress = cmd.get("progress", 0)
                 show_toast(f"Downloading... {int(progress * 100)}%")
-                needs_render = True
             elif cmd_type == "onedrive_error":
                 show_toast(f"OneDrive: {cmd.get('message', 'Error')}")
                 if onedrive_screen is not None:
                     onedrive_screen.loading = False
                 needs_render = True
-            elif cmd_type in ("companion_connected", "companion_disconnected"):
-                connected = cmd_type == "companion_connected"
-                show_toast(f"Companion {'connected' if connected else 'disconnected'}")
-                needs_render = True
-                if connected:
-                    broadcast_viewer_state()
+            elif cmd_type == "companion_connected":
+                print("Companion connected")
+                activate_display()
+                show_toast("Companion connected")
+                broadcast_viewer_state()
+            elif cmd_type == "companion_disconnected":
+                print("Companion disconnected")
+                deactivate_display()
         return events
 
     def broadcast_viewer_state():
@@ -604,7 +688,9 @@ def main():
         current_photo = None
         is_uhdr = False
         if state in (AppState.VIEWER, AppState.GRID) and len(source) > 0:
-            idx = viewer.current_index if state == AppState.VIEWER else grid.selected
+            idx = viewer.current_index if state == AppState.VIEWER and viewer else 0
+            if grid and state == AppState.GRID:
+                idx = grid.selected
             if 0 <= idx < len(source):
                 current_photo = source[idx].filename
                 is_uhdr = source[idx].is_ultrahdr
@@ -612,16 +698,17 @@ def main():
         server.broadcast_state({
             "type": "state",
             "app_state": state.name,
-            "current_index": viewer.current_index if state == AppState.VIEWER else grid.selected,
+            "current_index": (viewer.current_index if viewer and state == AppState.VIEWER
+                             else grid.selected if grid else 0),
             "total_photos": len(source),
-            "slideshow_active": viewer.slideshow_active,
+            "slideshow_active": viewer.slideshow_active if viewer else False,
             "zoom": vp["zoom"],
             "pan_cx": vp["cx"],
             "pan_cy": vp["cy"],
             "current_filename": current_photo,
             "is_ultrahdr": is_uhdr,
-            "hdr_active": display._hdr_active,
-            "gain_map_enabled": viewer.gain_map_enabled,
+            "hdr_active": display._hdr_active if display else False,
+            "gain_map_enabled": viewer.gain_map_enabled if viewer else True,
             "onedrive_authed": onedrive.is_authenticated if onedrive else False,
             "onedrive_user": onedrive.user_display_name if onedrive else None,
         })
@@ -646,21 +733,29 @@ def main():
             except Exception as e:
                 print(f"  thumbnail error [{i}]: {e}")
 
-    print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
-    print("  C: config   D: debug   G: gain map   H: HDR/SDR   M: show gain map")
-    if onedrive:
-        print("  O: OneDrive browser")
+    # -- Startup --
+
+    if no_standby:
+        activate_display()
+        print("\nReady. Arrow keys: navigate, Enter: view, Esc: back, Q: quit")
+        print("  C: config   D: debug   G: gain map   H: HDR/SDR   M: show gain map")
+        if onedrive:
+            print("  O: OneDrive browser")
+    else:
+        print("\nStandby mode. Waiting for companion app to connect...")
+
     print(f"  Companion server: ws://0.0.0.0:{server_port}")
 
     try:
         while True:
-            if state == AppState.VIEWER and viewer.tick():
+            if state == AppState.VIEWER and viewer and viewer.tick():
                 needs_render = True
 
-            # Check toast expiry
-            if toast_message and (time.monotonic() - toast_time) >= TOAST_DURATION:
-                toast_message = ""
-                needs_render = True  # Re-render to clear toast
+            # Check toast expiry (only when display active)
+            if display is not None and toast_message:
+                if (time.monotonic() - toast_time) >= TOAST_DURATION:
+                    toast_message = ""
+                    needs_render = True
 
             key_events = input_handler.poll(timeout=0.05)
 
@@ -669,7 +764,7 @@ def main():
             key_events.extend(server_events)
 
             # Check for viewport updates from companion app
-            if state == AppState.VIEWER:
+            if state == AppState.VIEWER and viewer:
                 vp, vp_seq = server.get_viewport()
                 if vp_seq != last_viewport_seq:
                     last_viewport_seq = vp_seq
@@ -677,7 +772,11 @@ def main():
                     needs_render = True
 
             for key_code, key_state in key_events:
-                if state == AppState.GRID:
+                if state == AppState.STANDBY:
+                    if key_code == KEY_Q:
+                        raise KeyboardInterrupt
+
+                elif state == AppState.GRID:
                     if key_code == KEY_LEFT:
                         grid.move_selection(-1, 0)
                         needs_render = True
@@ -691,7 +790,8 @@ def main():
                         grid.move_selection(0, 1)
                         needs_render = True
                     elif key_code in (KEY_ENTER, KEY_OK):
-                        enter_viewer(grid.selected)
+                        if len(source) > 0:
+                            enter_viewer(grid.selected)
                     elif key_code == KEY_C:
                         enter_config()
                     elif key_code == KEY_O:
@@ -764,7 +864,6 @@ def main():
 
                 elif state == AppState.ONEDRIVE_BROWSER and onedrive_screen is not None:
                     if key_code in (KEY_ESC, KEY_EXIT):
-                        # Navigate up or back to grid
                         parent = onedrive_screen.navigate_back()
                         if parent is not None:
                             server.request_folder_list(parent)
@@ -803,7 +902,8 @@ def main():
                 if needed:
                     server.request_thumbnails_onedrive(needed)
 
-            if needs_render:
+            # -- Render (only when display is active) --
+            if display is not None and needs_render:
                 t0 = time.monotonic()
                 hdr_active = display._hdr_active
 
@@ -845,7 +945,7 @@ def main():
                                 mm.seek(y * fb.pitch)
                                 mm.write(pixels[y].tobytes())
                     else:
-                        # Fast path: direct SSBO → mmap copy
+                        # Fast path: direct SSBO -> mmap copy
                         gpu.copy_to_framebuffer(fb)
                     t2 = time.monotonic()
                 else:
@@ -893,13 +993,8 @@ def main():
         print("\nExiting...")
 
     finally:
-        if gpu:
-            gpu.close()
-        if gpu_ctx:
-            gpu_ctx.close()
+        deactivate_display()
         input_handler.close()
-        fb.close()
-        display.close()
 
 
 if __name__ == "__main__":
