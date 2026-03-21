@@ -954,6 +954,35 @@ class DRMDisplay:
         self._hdr_active = enabled
         print(f"HDR {'enabled' if enabled else 'disabled'} (runtime toggle)")
 
+    def disable_output(self):
+        """Disable HDMI output via DPMS (TV shows 'No Signal').
+
+        Keeps the DRM fd open so we can re-enable later with set_mode().
+        """
+        if self.fd < 0:
+            return
+        try:
+            self.set_connector_property("DPMS", 3)  # DRM_MODE_DPMS_OFF
+        except OSError as e:
+            print(f"Warning: DPMS off failed: {e}")
+
+        # Disable HDR while output is off
+        try:
+            self.disable_hdr()
+        except OSError:
+            pass
+
+        # Destroy mode blob (set_mode will create a new one)
+        if self._mode_blob_id:
+            try:
+                destroy = drm_mode_destroy_blob(blob_id=self._mode_blob_id)
+                _ioctl(self.fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, destroy)
+            except OSError:
+                pass
+            self._mode_blob_id = 0
+
+        print("HDMI output disabled (DPMS off)")
+
     def close(self):
         """Clean up DRM resources."""
         if self.fd < 0:

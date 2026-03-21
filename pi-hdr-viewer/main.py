@@ -13,6 +13,7 @@ Usage:
 Options:
     --cpu           Force CPU (numpy) rendering pipeline instead of GPU
     --no-standby    Start with display active immediately (no companion app needed)
+    --disable-hdmi  Disable HDMI output completely in standby (TV shows 'No Signal')
     --port=PORT     WebSocket server port for companion app (default: 8765)
     --client-id=ID  Azure AD client ID for OneDrive integration
 
@@ -360,6 +361,7 @@ def main():
     # Parse arguments
     force_cpu = "--cpu" in sys.argv
     no_standby = "--no-standby" in sys.argv
+    disable_hdmi = "--disable-hdmi" in sys.argv
     server_port = 8765
     client_id = None
     for a in sys.argv[1:]:
@@ -435,13 +437,14 @@ def main():
         nonlocal display, gpu_ctx, gpu, grid, viewer, config_screen
         nonlocal onedrive_screen, fb, toast_font, state, needs_render
 
-        if display is not None:
+        if state != AppState.STANDBY:
             return  # Already active
 
         print("Activating display...")
         input_handler.grab()
-        display = DRMDisplay()
-        display.open()
+        if display is None:
+            display = DRMDisplay()
+            display.open()
 
         # GPU pipeline
         if not force_cpu:
@@ -497,7 +500,7 @@ def main():
         nonlocal display, gpu_ctx, gpu, grid, viewer, config_screen
         nonlocal onedrive_screen, fb, toast_font, state, needs_render
 
-        if display is None:
+        if state == AppState.STANDBY:
             return  # Already in standby
 
         print("Deactivating display...")
@@ -511,8 +514,14 @@ def main():
         if fb:
             fb.close()
             fb = None
-        display.close()
-        display = None
+
+        if disable_hdmi and display is not None:
+            # Keep DRM fd open but disable HDMI output (TV shows 'No Signal')
+            display.disable_output()
+        else:
+            if display is not None:
+                display.close()
+            display = None
 
         grid = None
         viewer = None
@@ -1005,6 +1014,10 @@ def main():
 
     finally:
         deactivate_display()
+        # Close DRM fd if still open (disable-hdmi keeps it open in standby)
+        if display is not None:
+            display.close()
+            display = None
         input_handler.close()
 
 
