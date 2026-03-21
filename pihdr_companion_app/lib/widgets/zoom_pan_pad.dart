@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -13,26 +14,53 @@ class ZoomPanPad extends ConsumerStatefulWidget {
 }
 
 class _ZoomPanPadState extends ConsumerState<ZoomPanPad> {
-  double _zoom = 1.0;
-  double _cx = 0.5;
-  double _cy = 0.5;
+  final TransformationController _transformController =
+      TransformationController();
   Timer? _throttleTimer;
   bool _dirty = false;
 
-  static const double _minZoom = 1.0;
-  static const double _maxZoom = 10.0;
+  Size? _imageNaturalSize;
+  int? _decodingForIndex; // prevents duplicate async calls
+  int? _displayedIndex; // tracks which photo we're showing
+  Size? _currentFittedSize;
+
   static const _throttleInterval = Duration(milliseconds: 33); // ~30fps
 
   @override
+  void initState() {
+    super.initState();
+    _transformController.addListener(_onTransformChanged);
+  }
+
+  @override
   void dispose() {
+    _transformController.removeListener(_onTransformChanged);
+    _transformController.dispose();
     _throttleTimer?.cancel();
     super.dispose();
   }
 
+  void _onTransformChanged() {
+    _scheduleUpdate();
+  }
+
   void _sendViewport() {
-    if (!_dirty) return;
+    if (!_dirty || _currentFittedSize == null) return;
     _dirty = false;
-    ref.read(wsServiceProvider).sendViewport(_cx, _cy, _zoom);
+
+    final matrix = _transformController.value;
+    final zoom = matrix.getMaxScaleOnAxis();
+    final tx = matrix.entry(0, 3);
+    final ty = matrix.entry(1, 3);
+
+    final w = _currentFittedSize!.width;
+    final h = _currentFittedSize!.height;
+
+    // Center of visible region in child coordinates, normalized to 0..1
+    final cx = ((w / 2 - tx) / zoom / w).clamp(0.0, 1.0);
+    final cy = ((h / 2 - ty) / zoom / h).clamp(0.0, 1.0);
+
+    ref.read(wsServiceProvider).sendViewport(cx, cy, zoom);
   }
 
   void _scheduleUpdate() {
@@ -43,140 +71,149 @@ class _ZoomPanPadState extends ConsumerState<ZoomPanPad> {
     }
   }
 
-  void _onScaleUpdate(ScaleUpdateDetails details) {
-    setState(() {
-      // Apply zoom from pinch gesture
-      if (details.scale != 1.0) {
-        _zoom = (_zoom * details.scale).clamp(_minZoom, _maxZoom);
-      }
-
-      // Apply pan from drag (normalized to 0..1)
-      if (_zoom > 1.0) {
-        final viewFrac = 1.0 / _zoom;
-        _cx = (_cx - details.focalPointDelta.dx / 300 * viewFrac)
-            .clamp(viewFrac / 2, 1.0 - viewFrac / 2);
-        _cy = (_cy - details.focalPointDelta.dy / 300 * viewFrac)
-            .clamp(viewFrac / 2, 1.0 - viewFrac / 2);
-      }
-    });
-    _scheduleUpdate();
-  }
-
   void _resetViewport() {
-    setState(() {
-      _zoom = 1.0;
-      _cx = 0.5;
-      _cy = 0.5;
-    });
+    _transformController.value = Matrix4.identity();
     _dirty = true;
     _sendViewport();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final viewFrac = 1.0 / _zoom;
+  Future<void> _decodeImageSize(int index) async {
+    _decodingForIndex = index;
+    final thumbnails = ref.read(thumbnailCacheProvider);
+    final bytes = thumbnails[index];
+    if (bytes == null) return;
 
-    return GestureDetector(
-      onScaleUpdate: _onScaleUpdate,
-      onDoubleTap: _resetViewport,
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.grey[900],
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.grey[700]!),
-        ),
-        child: Stack(
-          children: [
-            // Grid lines
-            CustomPaint(
-              size: Size.infinite,
-              painter: _GridPainter(),
-            ),
-            // Viewport rectangle
-            if (_zoom > 1.0)
-              Positioned.fill(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    final w = constraints.maxWidth;
-                    final h = constraints.maxHeight;
-                    final rectW = w * viewFrac;
-                    final rectH = h * viewFrac;
-                    final rectX = (_cx - viewFrac / 2) * w;
-                    final rectY = (_cy - viewFrac / 2) * h;
-
-                    return Stack(
-                      children: [
-                        Positioned(
-                          left: rectX,
-                          top: rectY,
-                          width: rectW,
-                          height: rectH,
-                          child: Container(
-                            decoration: BoxDecoration(
-                              border: Border.all(
-                                color: Colors.blue,
-                                width: 2,
-                              ),
-                              color: Colors.blue.withValues(alpha: 0.1),
-                            ),
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                ),
-              ),
-            // Zoom level label
-            Positioned(
-              bottom: 8,
-              right: 8,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  '${_zoom.toStringAsFixed(1)}x',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            ),
-            // Hint text
-            if (_zoom == 1.0)
-              const Center(
-                child: Text(
-                  'Pinch to zoom\nDrag to pan\nDouble-tap to reset',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.grey, fontSize: 14),
-                ),
-              ),
-          ],
-        ),
-      ),
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final size = Size(
+      frame.image.width.toDouble(),
+      frame.image.height.toDouble(),
     );
-  }
-}
+    frame.image.dispose();
+    codec.dispose();
 
-class _GridPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.grey[800]!
-      ..strokeWidth = 0.5;
-
-    // Draw 4x4 grid
-    for (int i = 1; i < 4; i++) {
-      final x = size.width * i / 4;
-      final y = size.height * i / 4;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    // Only apply if this is still the photo we want
+    if (mounted && _decodingForIndex == index) {
+      setState(() {
+        _imageNaturalSize = size;
+        _displayedIndex = index;
+      });
     }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  Widget build(BuildContext context) {
+    final viewerState = ref.watch(viewerStateProvider);
+    final thumbnails = ref.watch(thumbnailCacheProvider);
+    final currentIndex = viewerState.currentIndex;
+    final thumbBytes = thumbnails[currentIndex];
+
+    // Photo changed — reset zoom and start decoding new thumbnail
+    if (_displayedIndex != null && _displayedIndex != currentIndex) {
+      _transformController.value = Matrix4.identity();
+      _imageNaturalSize = null;
+      _dirty = true;
+      _sendViewport();
+    }
+
+    // Start decoding if needed
+    if (thumbBytes != null && _decodingForIndex != currentIndex) {
+      _decodeImageSize(currentIndex);
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (thumbBytes == null || _imageNaturalSize == null) {
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.grey[600],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Loading photo...',
+                  style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                ),
+              ],
+            ),
+          );
+        }
+
+        final fittedSize =
+            _computeFittedSize(constraints, _imageNaturalSize!);
+        _currentFittedSize = fittedSize;
+
+        final zoom = _transformController.value.getMaxScaleOnAxis();
+
+        return Center(
+          child: SizedBox(
+            width: fittedSize.width,
+            height: fittedSize.height,
+            child: GestureDetector(
+              onDoubleTap: _resetViewport,
+              child: ClipRect(
+                child: Stack(
+                  children: [
+                    InteractiveViewer(
+                      transformationController: _transformController,
+                      minScale: 1.0,
+                      maxScale: 10.0,
+                      child: Image.memory(
+                        thumbBytes,
+                        fit: BoxFit.fill,
+                        gaplessPlayback: true,
+                      ),
+                    ),
+                    // Zoom level label
+                    if (zoom > 1.01)
+                      Positioned(
+                        bottom: 8,
+                        right: 8,
+                        child: IgnorePointer(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '${zoom.toStringAsFixed(1)}x',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Size _computeFittedSize(BoxConstraints constraints, Size imageSize) {
+    final availW = constraints.maxWidth;
+    final availH = constraints.maxHeight;
+    final imageAspect = imageSize.width / imageSize.height;
+    final containerAspect = availW / availH;
+
+    if (imageAspect > containerAspect) {
+      return Size(availW, availW / imageAspect);
+    } else {
+      return Size(availH * imageAspect, availH);
+    }
+  }
 }
